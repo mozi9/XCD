@@ -1,45 +1,45 @@
-name: Repository Sync and Merge
+name: 仓库同步与合并
 
 on:
   workflow_dispatch:
     inputs:
-      action_type:
+      operation_type:
         description: '选择操作类型'
         required: true
         type: choice
         options:
-          - pull_branch
-          - merge_commit
-      target_repo:
-        description: '目标仓库 (格式: owner/repo，留空则使用当前仓库)'
-        required: false
-        default: ''
+          - 拉取仓库分支
+          - 合并特定提交
       source_repo:
-        description: '源仓库 (格式: owner/repo)'
+        description: '源仓库 (格式: 用户名/仓库名)'
         required: true
-        default: 'ApartTUSITU/kernel_xiaomi_sm8250_mod'
+        default: ''
       source_branch:
         description: '源分支'
         required: true
-        default: 'android16-aptusitu-new'
+        default: ''
       source_commit:
-        description: '源提交哈希 (仅在merge_commit时使用)'
+        description: '源提交哈希 (仅在"合并特定提交"时使用)'
         required: false
-        default: 'd54faa2'
+        default: ''
+      target_repo:
+        description: '目标仓库 (格式: 用户名/仓库名，留空则使用当前仓库)'
+        required: false
+        default: ''
       target_branch:
-        description: '目标分支 (仅在merge_commit时使用)'
+        description: '目标分支 (仅在"合并特定提交"时使用)'
         required: false
-        default: 'CI'
+        default: ''
       new_branch_name:
-        description: '新建分支名称 (仅在pull_branch时使用)'
+        description: '新建分支名称 (仅在"拉取仓库分支"时使用)'
         required: false
-        default: 'sync-android16-aptusitu-new'
+        default: ''
 
 jobs:
   repository-operation:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate inputs
+      - name: 验证输入参数
         id: validate
         run: |
           # 设置目标仓库，如果为空则使用当前仓库
@@ -49,48 +49,59 @@ jobs:
             echo "target_repo=${{ github.event.inputs.target_repo }}" >> $GITHUB_OUTPUT
           fi
           
-          # 验证操作类型参数
-          if [ "${{ github.event.inputs.action_type }}" != "pull_branch" ] && [ "${{ github.event.inputs.action_type }}" != "merge_commit" ]; then
-            echo "错误: 无效的操作类型"
+          # 验证必填参数
+          if [ -z "${{ github.event.inputs.source_repo }}" ]; then
+            echo "错误: 源仓库不能为空"
+            exit 1
+          fi
+          
+          if [ -z "${{ github.event.inputs.source_branch }}" ]; then
+            echo "错误: 源分支不能为空"
             exit 1
           fi
 
-      - name: Checkout target repository
+      - name: 检出目标仓库
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.validate.outputs.target_repo }}
           token: ${{ secrets.Mozi9_PAT }}
           fetch-depth: 0
 
-      - name: Configure Git identity
+      - name: 配置Git身份信息
         run: |
           git config --global user.name "mozi9"
           git config --global user.email "mozi9"
           git config --global push.default simple
 
-      - name: Add source repository as remote
+      - name: 添加源仓库远程
         run: |
-          echo "添加源仓库远程: ${{ github.event.inputs.source_repo }}"
+          echo "正在添加源仓库远程..."
           git remote add source https://${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.source_repo }}.git
           git fetch source ${{ github.event.inputs.source_branch }} --depth=1
 
-      - name: Execute Pull Branch Operation
-        if: ${{ github.event.inputs.action_type == 'pull_branch' }}
+      - name: 执行拉取仓库分支操作
+        if: ${{ github.event.inputs.operation_type == '拉取仓库分支' }}
         run: |
-          echo "开始执行拉取分支操作..."
-          echo "源分支: ${{ github.event.inputs.source_branch }}"
-          echo "新分支: ${{ github.event.inputs.new_branch_name }}"
+          echo "开始执行拉取仓库分支操作..."
+          
+          # 设置默认新分支名称
+          if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
+            NEW_BRANCH="sync-${{ github.event.inputs.source_branch }}"
+            echo "使用默认分支名称: $NEW_BRANCH"
+          else
+            NEW_BRANCH="${{ github.event.inputs.new_branch_name }}"
+          fi
           
           # 检查新分支是否已存在
-          if git show-ref --verify --quiet refs/heads/${{ github.event.inputs.new_branch_name }}; then
-            echo "警告: 分支 ${{ github.event.inputs.new_branch_name }} 已存在，将覆盖"
-            git branch -D ${{ github.event.inputs.new_branch_name }} || true
+          if git show-ref --verify --quiet refs/heads/$NEW_BRANCH; then
+            echo "分支 $NEW_BRANCH 已存在，将覆盖"
+            git branch -D $NEW_BRANCH || true
           fi
           
           # 创建新分支并切换到源分支内容
-          git checkout -b ${{ github.event.inputs.new_branch_name }} source/${{ github.event.inputs.source_branch }}
+          git checkout -b $NEW_BRANCH source/${{ github.event.inputs.source_branch }}
           
-          echo "重写提交作者信息..."
+          echo "正在重写提交作者信息..."
           # 重写所有提交的作者信息
           git filter-branch --env-filter '
             export GIT_COMMITTER_NAME="mozi9"
@@ -99,17 +110,25 @@ jobs:
             export GIT_AUTHOR_EMAIL="mozi9"
           ' -- --all
           
-          echo "推送到远程仓库..."
-          # 推送到新分支
-          git push origin ${{ github.event.inputs.new_branch_name }} --force
-          echo "✅ 拉取分支操作完成!"
+          echo "正在推送到远程仓库..."
+          git push origin $NEW_BRANCH --force
+          echo "✅ 拉取仓库分支操作完成!"
 
-      - name: Execute Merge Commit Operation
-        if: ${{ github.event.inputs.action_type == 'merge_commit' }}
+      - name: 执行合并特定提交操作
+        if: ${{ github.event.inputs.operation_type == '合并特定提交' }}
         run: |
-          echo "开始执行合并提交操作..."
-          echo "目标分支: ${{ github.event.inputs.target_branch }}"
-          echo "源提交: ${{ github.event.inputs.source_commit }}"
+          echo "开始执行合并特定提交操作..."
+          
+          # 验证提交参数
+          if [ -z "${{ github.event.inputs.source_commit }}" ]; then
+            echo "错误: 源提交哈希不能为空"
+            exit 1
+          fi
+          
+          if [ -z "${{ github.event.inputs.target_branch }}" ]; then
+            echo "错误: 目标分支不能为空"
+            exit 1
+          fi
           
           # 切换到目标分支
           git checkout ${{ github.event.inputs.target_branch }}
@@ -129,7 +148,7 @@ jobs:
           if git merge-base --is-ancestor ${{ github.event.inputs.source_commit }} HEAD; then
             echo "⚠️ 提交已存在于目标分支中，跳过cherry-pick"
           else
-            echo "应用提交更改..."
+            echo "正在应用提交更改..."
             # 应用更改但不提交
             git cherry-pick --no-commit ${{ github.event.inputs.source_commit }}
             
@@ -137,33 +156,37 @@ jobs:
             if git diff-index --quiet HEAD --; then
               echo "⚠️ 没有更改需要提交，可能提交已应用"
             else
-              echo "提交更改..."
+              echo "正在提交更改..."
               git add .
               git commit -m "$(cat commit_message.txt)" --author="mozi9 <mozi9>"
               
-              echo "推送到远程仓库..."
+              echo "正在推送到远程仓库..."
               git push origin ${{ github.event.inputs.target_branch }}
-              echo "✅ 合并提交操作完成!"
+              echo "✅ 合并特定提交操作完成!"
             fi
           fi
 
-      - name: Clean up
+      - name: 清理工作
         run: |
           git remote remove source || true
           rm -f commit_message.txt || true
           echo "清理完成"
 
-      - name: Create operation summary
+      - name: 生成操作摘要
         run: |
           echo "🎉 操作执行完成!"
           echo "================================"
-          echo "操作类型: ${{ github.event.inputs.action_type }}"
-          echo "目标仓库: ${{ steps.validate.outputs.target_repo }}"
+          echo "操作类型: ${{ github.event.inputs.operation_type }}"
           echo "源仓库: ${{ github.event.inputs.source_repo }}"
           echo "源分支: ${{ github.event.inputs.source_branch }}"
+          echo "目标仓库: ${{ steps.validate.outputs.target_repo }}"
           
-          if [ "${{ github.event.inputs.action_type }}" == "pull_branch" ]; then
-            echo "新建分支: ${{ github.event.inputs.new_branch_name }}"
+          if [ "${{ github.event.inputs.operation_type }}" == "拉取仓库分支" ]; then
+            if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
+              echo "新建分支: sync-${{ github.event.inputs.source_branch }}"
+            else
+              echo "新建分支: ${{ github.event.inputs.new_branch_name }}"
+            fi
           else
             echo "源提交: ${{ github.event.inputs.source_commit }}"
             echo "目标分支: ${{ github.event.inputs.target_branch }}"
