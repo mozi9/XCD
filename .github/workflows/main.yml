@@ -38,7 +38,7 @@ on:
           - 自动使用源版本
           - 自动使用目标版本
           - 手动解决（停止工作流）
-        default: '手动解决（停止工作流）'
+        default: '自动使用源版本'
 
 jobs:
   repository-operation:
@@ -162,35 +162,74 @@ jobs:
               case "${{ github.event.inputs.conflict_resolution }}" in
                 "自动使用源版本")
                   echo "使用源版本解决冲突..."
-                  # 对于每个冲突文件，使用源版本
-                  git status --porcelain | grep -E '^(AA|UU)' | cut -c4- | while read file; do
-                    if [ -f "$file" ]; then
-                      echo "使用源版本: $file"
-                      git checkout --theirs -- "$file"
-                      git add "$file"
-                    fi
+                  
+                  # 清理所有冲突残留文件
+                  find . -name "*.orig" -delete
+                  find . -name "*.BACKUP" -delete
+                  find . -name "*.BASE" -delete
+                  find . -name "*.LOCAL" -delete
+                  find . -name "*.REMOTE" -delete
+                  
+                  # 获取所有冲突文件
+                  CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+                  if [ -n "$CONFLICT_FILES" ]; then
+                    echo "冲突文件列表:"
+                    echo "$CONFLICT_FILES"
+                    
+                    # 对每个冲突文件使用源版本
+                    for file in $CONFLICT_FILES; do
+                      if [ -f "$file" ]; then
+                        echo "使用源版本解决: $file"
+                        # 使用源版本（theirs）
+                        git checkout --theirs -- "$file"
+                        git add "$file"
+                      fi
+                    done
+                  fi
+                  
+                  # 处理删除/修改冲突
+                  git status --porcelain | while read status file; do
+                    case "$status" in
+                      UD|DU)
+                        # 删除/修改冲突，使用源版本（删除文件）
+                        echo "删除文件: $file"
+                        git rm "$file" 2>/dev/null || true
+                        ;;
+                      DD)
+                        # 双方都删除，直接跳过
+                        echo "双方都删除的文件: $file"
+                        ;;
+                    esac
                   done
                   
-                  # 处理删除冲突
-                  git status --porcelain | grep -E '^UD' | cut -c4- | while read file; do
-                    echo "删除文件: $file"
-                    git rm "$file"
-                  done
-                  
+                  # 继续cherry-pick
                   git cherry-pick --continue
                   ;;
                   
                 "自动使用目标版本")
                   echo "使用目标版本解决冲突..."
-                  # 对于每个冲突文件，使用目标版本
-                  git status --porcelain | grep -E '^(AA|UU)' | cut -c4- | while read file; do
-                    if [ -f "$file" ]; then
-                      echo "使用目标版本: $file"
-                      git checkout --ours -- "$file"
-                      git add "$file"
-                    fi
-                  done
                   
+                  # 清理所有冲突残留文件
+                  find . -name "*.orig" -delete
+                  
+                  # 获取所有冲突文件
+                  CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+                  if [ -n "$CONFLICT_FILES" ]; then
+                    echo "冲突文件列表:"
+                    echo "$CONFLICT_FILES"
+                    
+                    # 对每个冲突文件使用目标版本
+                    for file in $CONFLICT_FILES; do
+                      if [ -f "$file" ]; then
+                        echo "使用目标版本解决: $file"
+                        # 使用目标版本（ours）
+                        git checkout --ours -- "$file"
+                        git add "$file"
+                      fi
+                    done
+                  fi
+                  
+                  # 继续cherry-pick
                   git cherry-pick --continue
                   ;;
                   
@@ -198,58 +237,63 @@ jobs:
                   echo "冲突需要手动解决"
                   echo "冲突文件列表:"
                   git status --porcelain
-                  echo "请手动解决冲突后，运行: git cherry-pick --continue"
+                  echo "请手动解决冲突后，运行: git add/rm <文件> 然后 git cherry-pick --continue"
                   exit 1
                   ;;
               esac
             fi
             
+            # 检查是否还有未解决的冲突
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              echo "错误: 仍有未解决的冲突"
+              git status
+              exit 1
+            fi
+            
             # 重写作者信息
             git commit --amend --author="mozi9 <mozi9>" --no-edit
             git push origin $TARGET_BRANCH
+            echo "✅ 合并提交操作完成"
           fi
 
       - name: 验证作者信息
+        if: ${{ github.event.inputs.operation_type == '合并特定提交' }}
         run: |
-          if [ "${{ github.event.inputs.operation_type }}" == "拉取仓库分支" ]; then
-            if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
-              BRANCH_NAME="sync-${{ steps.parse_url.outputs.source_branch }}"
-            else
-              BRANCH_NAME="${{ github.event.inputs.new_branch_name }}"
-            fi
+          if [ -z "${{ github.event.inputs.target_branch }}" ]; then
+            BRANCH_NAME="${{ github.ref_name }}"
           else
-            if [ -z "${{ github.event.inputs.target_branch }}" ]; then
-              BRANCH_NAME="${{ github.ref_name }}"
-            else
-              BRANCH_NAME="${{ github.event.inputs.target_branch }}"
-            fi
+            BRANCH_NAME="${{ github.event.inputs.target_branch }}"
           fi
           
           git checkout $BRANCH_NAME
           AUTHOR_NAME=$(git log -1 --format="%an")
           
           if [ "$AUTHOR_NAME" == "mozi9" ]; then
-            echo "作者信息验证通过"
+            echo "✅ 作者信息验证通过"
           else
-            echo "作者信息验证失败"
+            echo "❌ 作者信息验证失败"
             exit 1
           fi
 
-      - name: 清理冲突文件
+      - name: 清理工作
         if: always()
         run: |
-          # 清理可能的冲突残留文件
-          find . -name "*.orig" -delete
-          find . -name "*.BACKUP" -delete
-          find . -name "*.BASE" -delete
-          find . -name "*.LOCAL" -delete
-          find . -name "*.REMOTE" -delete
-          git clean -fd || true
+          git remote remove source || true
+          # 最终清理所有冲突文件
+          find . -name "*.orig" -delete 2>/dev/null || true
+          find . -name "*.BACKUP" -delete 2>/dev/null || true
+          find . -name "*.BASE" -delete 2>/dev/null || true
+          find . -name "*.LOCAL" -delete 2>/dev/null || true
+          find . -name "*.REMOTE" -delete 2>/dev/null || true
 
       - name: 生成操作摘要
         run: |
-          echo "操作执行完成"
+          echo "🎉 操作执行完成"
+          echo "================================"
           echo "操作类型: ${{ github.event.inputs.operation_type }}"
           echo "源仓库: ${{ steps.parse_url.outputs.source_full_name }}"
           echo "源分支: ${{ steps.parse_url.outputs.source_branch }}"
           echo "目标仓库: ${{ steps.parse_url.outputs.target_full_name }}"
+          echo "冲突解决策略: ${{ github.event.inputs.conflict_resolution }}"
+          echo "操作时间: $(date)"
+          echo "================================"
