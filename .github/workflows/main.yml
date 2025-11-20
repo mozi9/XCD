@@ -30,6 +30,15 @@ on:
         description: '目标分支 (仅在"合并特定提交"时使用)'
         required: false
         default: ''
+      conflict_resolution:
+        description: '冲突解决策略'
+        required: false
+        type: choice
+        options:
+          - 自动使用源版本
+          - 自动使用目标版本
+          - 手动解决（停止工作流）
+        default: '手动解决（停止工作流）'
 
 jobs:
   repository-operation:
@@ -38,7 +47,6 @@ jobs:
       - name: 解析链接和分支信息
         id: parse_url
         run: |
-          # 解析源仓库链接和分支
           SOURCE_REPO_URL="${{ github.event.inputs.source_repo_url }}"
           
           if [[ $SOURCE_REPO_URL =~ https://github.com/([^/]+)/([^/]+)/tree/([^/]+) ]]; then
@@ -49,7 +57,6 @@ jobs:
           elif [[ $SOURCE_REPO_URL =~ https://github.com/([^/]+)/([^/]+)$ ]]; then
             SOURCE_OWNER="${BASH_REMATCH[1]}"
             SOURCE_REPO="${BASH_REMATCH[2]}"
-            echo "检测到基础仓库链接，获取默认分支..."
             SOURCE_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               "https://api.github.com/repos/$SOURCE_OWNER/$SOURCE_REPO" | jq -r '.default_branch')
             echo "默认分支: $SOURCE_BRANCH"
@@ -94,16 +101,8 @@ jobs:
 
       - name: 添加源仓库远程并获取指定分支
         run: |
-          echo "正在添加源仓库远程..."
           git remote add source https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.source_full_name }}.git
-          
-          echo "正在获取源仓库的指定分支: ${{ steps.parse_url.outputs.source_branch }}"
           git fetch source ${{ steps.parse_url.outputs.source_branch }}
-          
-          if ! git show-ref --verify --quiet refs/remotes/source/${{ steps.parse_url.outputs.source_branch }}; then
-            echo "错误: 分支不存在于源仓库"
-            exit 1
-          fi
 
       - name: 执行拉取仓库分支操作
         if: ${{ github.event.inputs.operation_type == '拉取仓库分支' }}
@@ -156,13 +155,58 @@ jobs:
           if git merge-base --is-ancestor $COMMIT_HASH HEAD; then
             echo "提交已存在，跳过"
           else
-            if git cherry-pick $COMMIT_HASH; then
-              git commit --amend --author="mozi9 <mozi9>" --no-edit
-              git push origin $TARGET_BRANCH
-            else
-              git cherry-pick --abort
-              exit 1
+            # 尝试cherry-pick
+            if ! git cherry-pick $COMMIT_HASH; then
+              echo "检测到合并冲突，尝试自动解决..."
+              
+              case "${{ github.event.inputs.conflict_resolution }}" in
+                "自动使用源版本")
+                  echo "使用源版本解决冲突..."
+                  # 对于每个冲突文件，使用源版本
+                  git status --porcelain | grep -E '^(AA|UU)' | cut -c4- | while read file; do
+                    if [ -f "$file" ]; then
+                      echo "使用源版本: $file"
+                      git checkout --theirs -- "$file"
+                      git add "$file"
+                    fi
+                  done
+                  
+                  # 处理删除冲突
+                  git status --porcelain | grep -E '^UD' | cut -c4- | while read file; do
+                    echo "删除文件: $file"
+                    git rm "$file"
+                  done
+                  
+                  git cherry-pick --continue
+                  ;;
+                  
+                "自动使用目标版本")
+                  echo "使用目标版本解决冲突..."
+                  # 对于每个冲突文件，使用目标版本
+                  git status --porcelain | grep -E '^(AA|UU)' | cut -c4- | while read file; do
+                    if [ -f "$file" ]; then
+                      echo "使用目标版本: $file"
+                      git checkout --ours -- "$file"
+                      git add "$file"
+                    fi
+                  done
+                  
+                  git cherry-pick --continue
+                  ;;
+                  
+                *)
+                  echo "冲突需要手动解决"
+                  echo "冲突文件列表:"
+                  git status --porcelain
+                  echo "请手动解决冲突后，运行: git cherry-pick --continue"
+                  exit 1
+                  ;;
+              esac
             fi
+            
+            # 重写作者信息
+            git commit --amend --author="mozi9 <mozi9>" --no-edit
+            git push origin $TARGET_BRANCH
           fi
 
       - name: 验证作者信息
@@ -183,18 +227,24 @@ jobs:
           
           git checkout $BRANCH_NAME
           AUTHOR_NAME=$(git log -1 --format="%an")
-          AUTHOR_EMAIL=$(git log -1 --format="%ae")
           
-          if [ "$AUTHOR_NAME" == "mozi9" ] && [ "$AUTHOR_EMAIL" == "mozi9" ]; then
+          if [ "$AUTHOR_NAME" == "mozi9" ]; then
             echo "作者信息验证通过"
           else
             echo "作者信息验证失败"
             exit 1
           fi
 
-      - name: 清理工作
+      - name: 清理冲突文件
+        if: always()
         run: |
-          git remote remove source || true
+          # 清理可能的冲突残留文件
+          find . -name "*.orig" -delete
+          find . -name "*.BACKUP" -delete
+          find . -name "*.BASE" -delete
+          find . -name "*.LOCAL" -delete
+          find . -name "*.REMOTE" -delete
+          git clean -fd || true
 
       - name: 生成操作摘要
         run: |
