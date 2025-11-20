@@ -10,28 +10,24 @@ on:
         options:
           - 拉取仓库分支
           - 合并特定提交
-      source_repo:
-        description: '源仓库 (格式: 用户名/仓库名)'
+      source_repo_url:
+        description: '源仓库链接 (支持带分支的链接)'
         required: true
+        default: 'https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod'
+      target_repo_url:
+        description: '目标仓库链接 (留空则使用当前仓库)'
+        required: false
         default: ''
-      source_branch:
-        description: '源分支'
-        required: true
+      new_branch_name:
+        description: '新建分支名称 (仅在"拉取仓库分支"时使用)'
+        required: false
         default: ''
       source_commit:
         description: '源提交哈希 (仅在"合并特定提交"时使用)'
         required: false
         default: ''
-      target_repo:
-        description: '目标仓库 (格式: 用户名/仓库名，留空则使用当前仓库)'
-        required: false
-        default: ''
       target_branch:
         description: '目标分支 (仅在"合并特定提交"时使用)'
-        required: false
-        default: ''
-      new_branch_name:
-        description: '新建分支名称 (仅在"拉取仓库分支"时使用)'
         required: false
         default: ''
 
@@ -39,32 +35,55 @@ jobs:
   repository-operation:
     runs-on: ubuntu-latest
     steps:
-      - name: 验证输入参数
-        id: validate
+      - name: 解析链接和分支信息
+        id: parse_url
         run: |
-          # 设置目标仓库，如果为空则使用当前仓库
-          if [ -z "${{ github.event.inputs.target_repo }}" ]; then
-            echo "target_repo=${{ github.repository }}" >> $GITHUB_OUTPUT
-          else
-            echo "target_repo=${{ github.event.inputs.target_repo }}" >> $GITHUB_OUTPUT
-          fi
+          # 解析源仓库链接和分支
+          SOURCE_REPO_URL="${{ github.event.inputs.source_repo_url }}"
           
-          # 验证必填参数
-          if [ -z "${{ github.event.inputs.source_repo }}" ]; then
-            echo "错误: 源仓库不能为空"
+          if [[ $SOURCE_REPO_URL =~ https://github.com/([^/]+)/([^/]+)/tree/([^/]+) ]]; then
+            SOURCE_OWNER="${BASH_REMATCH[1]}"
+            SOURCE_REPO="${BASH_REMATCH[2]}"
+            SOURCE_BRANCH="${BASH_REMATCH[3]}"
+            echo "检测到带分支的链接，分支: $SOURCE_BRANCH"
+          elif [[ $SOURCE_REPO_URL =~ https://github.com/([^/]+)/([^/]+)$ ]]; then
+            SOURCE_OWNER="${BASH_REMATCH[1]}"
+            SOURCE_REPO="${BASH_REMATCH[2]}"
+            echo "检测到基础仓库链接，获取默认分支..."
+            SOURCE_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/$SOURCE_OWNER/$SOURCE_REPO" | jq -r '.default_branch')
+            echo "默认分支: $SOURCE_BRANCH"
+          else
+            echo "错误: 源仓库链接格式不正确"
             exit 1
           fi
           
-          if [ -z "${{ github.event.inputs.source_branch }}" ]; then
-            echo "错误: 源分支不能为空"
+          echo "source_owner=$SOURCE_OWNER" >> $GITHUB_OUTPUT
+          echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
+          echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
+          echo "source_full_name=$SOURCE_OWNER/$SOURCE_REPO" >> $GITHUB_OUTPUT
+          
+          TARGET_REPO_URL="${{ github.event.inputs.target_repo_url }}"
+          if [ -z "$TARGET_REPO_URL" ]; then
+            echo "target_owner=${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+            echo "target_repo=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+            echo "target_full_name=${{ github.repository }}" >> $GITHUB_OUTPUT
+          elif [[ $TARGET_REPO_URL =~ https://github.com/([^/]+)/([^/]+) ]]; then
+            TARGET_OWNER="${BASH_REMATCH[1]}"
+            TARGET_REPO="${BASH_REMATCH[2]}"
+            echo "target_owner=$TARGET_OWNER" >> $GITHUB_OUTPUT
+            echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
+            echo "target_full_name=$TARGET_OWNER/$TARGET_REPO" >> $GITHUB_OUTPUT
+          else
+            echo "错误: 目标仓库链接格式不正确"
             exit 1
           fi
 
       - name: 检出目标仓库
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.validate.outputs.target_repo }}
-          token: ${{ secrets.Mozi9_PAT }}
+          repository: ${{ steps.parse_url.outputs.target_full_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: 配置Git身份信息
@@ -73,128 +92,114 @@ jobs:
           git config --global user.email "mozi9"
           git config --global push.default simple
 
-      - name: 添加源仓库远程并获取完整历史
+      - name: 添加源仓库远程并获取指定分支
         run: |
           echo "正在添加源仓库远程..."
-          git remote add source https://${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.source_repo }}.git
-          echo "正在获取源仓库的完整提交历史..."
-          git fetch source --unshallow || git fetch source --depth=100
+          git remote add source https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.source_full_name }}.git
+          
+          echo "正在获取源仓库的指定分支: ${{ steps.parse_url.outputs.source_branch }}"
+          git fetch source ${{ steps.parse_url.outputs.source_branch }}
+          
+          if ! git show-ref --verify --quiet refs/remotes/source/${{ steps.parse_url.outputs.source_branch }}; then
+            echo "错误: 分支不存在于源仓库"
+            exit 1
+          fi
 
       - name: 执行拉取仓库分支操作
         if: ${{ github.event.inputs.operation_type == '拉取仓库分支' }}
         run: |
-          echo "开始执行拉取仓库分支操作..."
+          SOURCE_BRANCH="${{ steps.parse_url.outputs.source_branch }}"
           
-          # 设置默认新分支名称
           if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
-            NEW_BRANCH="sync-${{ github.event.inputs.source_branch }}"
-            echo "使用默认分支名称: $NEW_BRANCH"
+            NEW_BRANCH="sync-$SOURCE_BRANCH"
           else
             NEW_BRANCH="${{ github.event.inputs.new_branch_name }}"
           fi
           
-          # 检查新分支是否已存在
           if git show-ref --verify --quiet refs/heads/$NEW_BRANCH; then
-            echo "分支 $NEW_BRANCH 已存在，将覆盖"
             git branch -D $NEW_BRANCH || true
           fi
           
-          # 创建新分支并切换到源分支内容
-          git checkout -b $NEW_BRANCH source/${{ github.event.inputs.source_branch }}
+          git checkout -b $NEW_BRANCH source/$SOURCE_BRANCH
           
-          echo "正在重写提交作者信息..."
-          # 重写所有提交的作者信息
-          git filter-branch --env-filter '
+          git filter-branch -f --env-filter '
+            export GIT_AUTHOR_NAME="mozi9"
+            export GIT_AUTHOR_EMAIL="mozi9"
             export GIT_COMMITTER_NAME="mozi9"
             export GIT_COMMITTER_EMAIL="mozi9"
-            export GIT_AUTHOR_NAME="mozi9" 
-            export GIT_AUTHOR_EMAIL="mozi9"
           ' -- --all
           
-          echo "正在推送到远程仓库..."
-          git push origin $NEW_BRANCH --force
-          echo "✅ 拉取仓库分支操作完成!"
+          git push -u origin $NEW_BRANCH --force
 
       - name: 执行合并特定提交操作
         if: ${{ github.event.inputs.operation_type == '合并特定提交' }}
         run: |
-          echo "开始执行合并特定提交操作..."
-          
-          # 验证提交参数
           if [ -z "${{ github.event.inputs.source_commit }}" ]; then
             echo "错误: 源提交哈希不能为空"
             exit 1
           fi
           
           if [ -z "${{ github.event.inputs.target_branch }}" ]; then
-            echo "错误: 目标分支不能为空"
-            exit 1
-          fi
-          
-          # 切换到目标分支
-          git checkout ${{ github.event.inputs.target_branch }}
-          git pull origin ${{ github.event.inputs.target_branch }}
-          
-          # 验证提交是否存在
-          echo "正在验证提交 ${{ github.event.inputs.source_commit }} 是否存在..."
-          if ! git cat-file -e ${{ github.event.inputs.source_commit }}^0; then
-            echo "错误: 提交 ${{ github.event.inputs.source_commit }} 不存在"
-            echo "可用的提交列表:"
-            git log source/${{ github.event.inputs.source_branch }} --oneline -10
-            exit 1
-          fi
-          
-          # 获取提交信息
-          git show --format=format:"%B" ${{ github.event.inputs.source_commit }} --quiet > commit_message.txt
-          echo "提交信息: $(cat commit_message.txt)"
-          
-          # 检查是否已经包含该提交
-          if git merge-base --is-ancestor ${{ github.event.inputs.source_commit }} HEAD; then
-            echo "⚠️ 提交已存在于目标分支中，跳过cherry-pick"
+            TARGET_BRANCH="${{ github.ref_name }}"
           else
-            echo "正在应用提交更改..."
-            # 尝试cherry-pick
-            if git cherry-pick ${{ github.event.inputs.source_commit }}; then
-              echo "✅ cherry-pick 成功"
-              
-              echo "正在重写提交作者信息..."
-              # 重写最新提交的作者信息
+            TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          fi
+          
+          git checkout $TARGET_BRANCH
+          git pull origin $TARGET_BRANCH
+          
+          COMMIT_HASH="${{ github.event.inputs.source_commit }}"
+          if ! git cat-file -e $COMMIT_HASH^0; then
+            git fetch source $COMMIT_HASH || exit 1
+          fi
+          
+          if git merge-base --is-ancestor $COMMIT_HASH HEAD; then
+            echo "提交已存在，跳过"
+          else
+            if git cherry-pick $COMMIT_HASH; then
               git commit --amend --author="mozi9 <mozi9>" --no-edit
-              
-              echo "正在推送到远程仓库..."
-              git push origin ${{ github.event.inputs.target_branch }}
-              echo "✅ 合并特定提交操作完成!"
+              git push origin $TARGET_BRANCH
             else
-              echo "❌ cherry-pick 失败，可能存在冲突"
-              echo "请手动解决冲突后提交"
-              git status
+              git cherry-pick --abort
               exit 1
             fi
+          fi
+
+      - name: 验证作者信息
+        run: |
+          if [ "${{ github.event.inputs.operation_type }}" == "拉取仓库分支" ]; then
+            if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
+              BRANCH_NAME="sync-${{ steps.parse_url.outputs.source_branch }}"
+            else
+              BRANCH_NAME="${{ github.event.inputs.new_branch_name }}"
+            fi
+          else
+            if [ -z "${{ github.event.inputs.target_branch }}" ]; then
+              BRANCH_NAME="${{ github.ref_name }}"
+            else
+              BRANCH_NAME="${{ github.event.inputs.target_branch }}"
+            fi
+          fi
+          
+          git checkout $BRANCH_NAME
+          AUTHOR_NAME=$(git log -1 --format="%an")
+          AUTHOR_EMAIL=$(git log -1 --format="%ae")
+          
+          if [ "$AUTHOR_NAME" == "mozi9" ] && [ "$AUTHOR_EMAIL" == "mozi9" ]; then
+            echo "作者信息验证通过"
+          else
+            echo "作者信息验证失败"
+            exit 1
           fi
 
       - name: 清理工作
         run: |
           git remote remove source || true
-          rm -f commit_message.txt || true
-          echo "清理完成"
 
       - name: 生成操作摘要
         run: |
-          echo "🎉 操作执行完成!"
-          echo "================================"
+          echo "操作执行完成"
           echo "操作类型: ${{ github.event.inputs.operation_type }}"
-          echo "源仓库: ${{ github.event.inputs.source_repo }}"
-          echo "源分支: ${{ github.event.inputs.source_branch }}"
-          echo "目标仓库: ${{ steps.validate.outputs.target_repo }}"
-          
-          if [ "${{ github.event.inputs.operation_type }}" == "拉取仓库分支" ]; then
-            if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
-              echo "新建分支: sync-${{ github.event.inputs.source_branch }}"
-            else
-              echo "新建分支: ${{ github.event.inputs.new_branch_name }}"
-            fi
-          else
-            echo "源提交: ${{ github.event.inputs.source_commit }}"
-            echo "目标分支: ${{ github.event.inputs.target_branch }}"
-          fi
-          echo "================================"
+          echo "源仓库: ${{ steps.parse_url.outputs.source_full_name }}"
+          echo "源分支: ${{ steps.parse_url.outputs.source_branch }}"
+          echo "目标仓库: ${{ steps.parse_url.outputs.target_full_name }}"
