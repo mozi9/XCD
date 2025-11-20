@@ -6,7 +6,7 @@ on:
       target_device:
         description: 'Target device'
         required: true
-        default: 'munch'
+        default: 'alioth'
         type: choice
         options:
           - 'munch'
@@ -21,7 +21,6 @@ on:
           - 'enuma'
           - 'dagu'
           - 'pipa'
-
       system_version:
         description: 'Target System'
         required: true
@@ -31,7 +30,6 @@ on:
           - 'aosp'
           - 'miui'
           - 'all'
-
       kernelsu_version:
         description: 'KernelSU Version'
         required: true
@@ -43,50 +41,73 @@ on:
           - 'rksu'
           - 'sukisu'
           - 'noksu'
-
       additional_function:
         description: 'Additional Functions'
         required: true
         type: choice
-        default: 'no'
+        default: 'susfs-kpm'
         options:
           - 'no'
           - 'susfs-kpm'
           - 'susfs'
           - 'kpm'
+      enable_ccache:
+        description: 'Enable ccache'
+        required: true
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
+      skip_clean:
+        description: 'Skip clean build directory'
+        required: true
+        type: choice
+        default: 'false'
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Clone Kernel Source
-        uses: actions/checkout@v4
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v5
 
       - name: Install Dependencies
         run: |
           sudo apt-get update -y 
-          sudo apt-get install -y \
-          build-essential git curl wget bison flex zip bc \
-          cpio libssl-dev libncurses-dev gcc \
-          python3 python3-pip ccache
-            
-      - name: Cache Proton Clang
-        uses: actions/cache@v4
-        id: clang-cache
-        with:
-          path: toolchain/proton-clang
-          key: ${{ runner.os }}-proton-clang
+          sudo apt-get install -y build-essential git curl wget bison flex zip bc cpio libssl-dev libncurses-dev python3 python3-pip ccache
 
-      - name: Download Proton Clang Toolchain
-        if: steps.clang-cache.outputs.cache-hit != 'true'
+      - name: Cache ZyC-clang
+        uses: actions/cache@v4
+        id: zyc-clang-cache
+        with:
+          path: /home/runner/ZyC-clang
+          key: ${{ runner.os }}-zyc-clang-22.0.0git-20250924
+
+      - name: Setup ZyC-clang toolchain
+        if: steps.zyc-clang-cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p toolchain; cd toolchain
-          wget https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.zip
-          unzip 20210522.zip
-          mv proton-clang-20210522 proton-clang
-          rm proton-clang/bin/ld 20210522.zip
-          
+          mkdir -p /home/runner/ZyC-clang
+          cd /home/runner/ZyC-clang
+          wget https://github.com/ZyCromerZ/Clang/releases/download/22.0.0git-20250924-release/Clang-22.0.0git-20250924.tar.gz
+          tar -zxf Clang-22.0.0git-20250924.tar.gz
+          cd $GITHUB_WORKSPACE
+
+      - name: Verify Toolchain Installation
+        run: |
+          echo "Checking toolchain installation..."
+          ls -la /home/runner/ZyC-clang/
+          if [ -d "/home/runner/ZyC-clang/bin" ]; then
+            echo "Toolchain bin directory exists"
+            ls /home/runner/ZyC-clang/bin/ | head -10
+          else
+            echo "Searching for bin directory..."
+            find /home/runner/ZyC-clang -name "clang" -type f | head -5
+          fi
+
       - name: Cache ccache
         uses: actions/cache@v4
         with:
@@ -96,27 +117,97 @@ jobs:
             ${{ runner.os }}-ccache-${{ github.event.inputs.target_device }}-
 
       - name: Build Kernel
+        env:
+          TOOLCHAIN_PATH: /home/runner/ZyC-clang
         run: |
-          sed -i 's|TOOLCHAIN_PATH=\$HOME/toolchain/proton-clang/bin|TOOLCHAIN_PATH=$(pwd)/toolchain/proton-clang/bin|' build.sh
+          export PATH="$TOOLCHAIN_PATH/bin:$PATH"
+          echo "PATH: $PATH"
+          echo "TOOLCHAIN_PATH: $TOOLCHAIN_PATH"
+          
+          which clang && clang --version
+          which clang++ && clang++ --version
+          which ld.lld && ld.lld --version
+          
+          # 修复参数传递 - 确保正确的参数格式
           DEVICE="${{ github.event.inputs.target_device }}"
           SYSTEM="${{ github.event.inputs.system_version }}"
           KSU_VERSION="${{ github.event.inputs.kernelsu_version }}"
           ADDITIONAL_FUNCTION="${{ github.event.inputs.additional_function }}"
-          bash build.sh "$DEVICE" "$KSU_VERSION" $ADDITIONAL_FUNCTION "$SYSTEM"
+          CCACHE_ENABLED="${{ github.event.inputs.enable_ccache }}"
+          SKIP_CLEAN="${{ github.event.inputs.skip_clean }}"
+          
+          # 构建正确的参数格式
+          BUILD_ARGS="$DEVICE"
+          
+          # 只有不是noksu时才添加KSU参数
+          if [ "$KSU_VERSION" != "noksu" ]; then
+            BUILD_ARGS="$BUILD_ARGS --ksu $KSU_VERSION"
+          fi
+          
+          # 只有不是no时才添加附加功能参数
+          if [ "$ADDITIONAL_FUNCTION" != "no" ]; then
+            BUILD_ARGS="$BUILD_ARGS --additional $ADDITIONAL_FUNCTION"
+          fi
+          
+          # 添加系统参数
+          BUILD_ARGS="$BUILD_ARGS --system $SYSTEM"
+          
+          # 处理ccache选项
+          if [ "$CCACHE_ENABLED" = "false" ]; then
+            BUILD_ARGS="$BUILD_ARGS --noccache"
+          fi
+          
+          # 处理清理选项
+          if [ "$SKIP_CLEAN" = "true" ]; then
+            BUILD_ARGS="$BUILD_ARGS --noclean"
+          fi
+          
+          echo "构建参数: $BUILD_ARGS"
+          echo "执行命令: bash build.sh $BUILD_ARGS"
+          
+          # 执行构建脚本
+          bash build.sh $BUILD_ARGS
 
       - name: Set Kernel Path
         run: |
-          if [[ "${{ github.event.inputs.system_version }}" == "aosp" || "${{ github.event.inputs.system_version }}" == "miui" ]]; then
-              KernelPath=$(ls Kernel_* 2>/dev/null || true)
+          case "${{ github.event.inputs.system_version }}" in
+            "aosp")
+              KernelPath=$(ls Kernel_AOSP_* 2>/dev/null || true)
               echo "KernelPath=$(pwd)/$KernelPath" >> $GITHUB_ENV
-          else
-              tar -czvf Kernel_All.tar.gz Kernel_*
-              KernelPath=$(pwd)/Kernel_All.tar.gz
+              ;;
+            "miui")
+              KernelPath=$(ls Kernel_MIUI_* 2>/dev/null || true)
+              echo "KernelPath=$(pwd)/$KernelPath" >> $GITHUB_ENV
+              ;;
+            "all")
+              tar -czvf Kernel_All_${{ github.event.inputs.target_device }}_${{ github.run_id }}.tar.gz Kernel_*
+              KernelPath=$(pwd)/Kernel_All_${{ github.event.inputs.target_device }}_${{ github.run_id }}.tar.gz
               echo "KernelPath=$KernelPath" >> $GITHUB_ENV
+              ;;
+          esac
+          
+          if [ -z "$KernelPath" ]; then
+            echo "错误: 未找到内核文件"
+            ls -la Kernel_* 2>/dev/null || echo "没有找到Kernel_*文件"
+            exit 1
           fi
-      
+          
+          echo "找到内核文件: $KernelPath"
+
       - name: Upload Kernel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: Kernel
+          name: Kernel_${{ github.event.inputs.target_device }}_${{ github.run_id }}
           path: ${{ env.KernelPath }}
+
+      - name: Show Build Info
+        run: |
+          echo "=== 构建信息 ==="
+          echo "设备: ${{ github.event.inputs.target_device }}"
+          echo "系统: ${{ github.event.inputs.system_version }}"
+          echo "KernelSU: ${{ github.event.inputs.kernelsu_version }}"
+          echo "附加功能: ${{ github.event.inputs.additional_function }}"
+          echo "CCache启用: ${{ github.event.inputs.enable_ccache }}"
+          echo "跳过清理: ${{ github.event.inputs.skip_clean }}"
+          echo "内核文件: ${{ env.KernelPath }}"
+          echo "========================"
