@@ -1,0 +1,58 @@
+name: Sync Repository and Create Branch
+
+on:
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      source_repo:
+        description: '源仓库 (格式: owner/repo)'
+        required: true
+        default: 'mozi9/kernel_xiaomi_sm8250'
+      target_repo:
+        description: '目标仓库 (格式: owner/repo)'
+        required: true
+        default: 'mozi9/XCD'
+      new_branch:
+        description: '要创建的新分支名称'
+        required: true
+        default: 'susfs'
+
+jobs:
+  sync-repositories:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ secrets.Mozi9_PAT }}  # 使用您的 PAT 令牌
+        fetch-depth: 0
+
+    - name: Configure Git
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+
+    - name: Add source repository as remote
+      run: |
+        git remote add source https://${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source
+
+    - name: Get source default branch
+      id: get_branch
+      run: |
+        # 使用 PAT 访问 GitHub API
+        DEFAULT_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.Mozi9_PAT }}" \
+          https://api.github.com/repos/${{ github.event.inputs.source_repo }} | jq -r .default_branch)
+        echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Create and switch to new branch
+      run: |
+        git checkout -b ${{ github.event.inputs.new_branch }} source/${{ steps.get_branch.outputs.default_branch }}
+
+    - name: Push to target repository
+      run: |
+        git push -u origin ${{ github.event.inputs.new_branch }}
+
+    - name: Cleanup
+      run: |
+        git remote remove source
