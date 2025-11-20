@@ -1,0 +1,339 @@
+name: Manual SusFS File Extraction and Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commits:
+        description: "Source commit hashes (short or full, comma separated)"
+        required: true
+        default: "a5e7449c5f31d4f01377a4ce4e324bec57053e6e"
+      source_branch:
+        description: "Source branch to get commits from"
+        required: true
+        default: "susfs-2.0.0"
+      target_branch:
+        description: "Target branch to push to"
+        required: true
+        default: "susfs"
+
+env:
+  SOURCE_REPO: "YangQi0408/kernel_xiaomi_sm8250_mod"
+  TARGET_REPO: "mozi9/XCD"
+  COMMIT_AUTHOR: "mozi9"
+  COMMIT_EMAIL: "mozi9"
+  COMMIT_MESSAGE: "fs: Bump SuSFS version to v2.0.0"
+  COMMIT_DESCRIPTION: "https://gitlab.com/simonpunk/susfs4ksu/-/commit/a5e7449c5f31d4f01377a4ce4e324bec57053e6e"
+
+jobs:
+  extract-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.SOURCE_REPO }}
+        ref: ${{ inputs.source_branch }}
+        token: ${{ secrets.Mozi9_PAT }}
+        path: source-repo
+        fetch-depth: 0
+
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.TARGET_REPO }}
+        ref: ${{ inputs.target_branch }}
+        token: ${{ secrets.Mozi9_PAT }}
+        path: target-repo
+        fetch-depth: 0
+
+    - name: Setup Git identity
+      run: |
+        git config --global user.name "${{ env.COMMIT_AUTHOR }}"
+        git config --global user.email "${{ env.COMMIT_EMAIL }}"
+
+    - name: Resolve commit hashes
+      id: resolve-commits
+      run: |
+        cd source-repo
+        
+        # 清理输入，分割多个提交哈希
+        COMMITS=$(echo "${{ inputs.source_commits }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+        
+        FULL_HASHES=""
+        RESOLVED_COMMITS=""
+        
+        echo "Input commits: $COMMITS"
+        
+        # 解析每个提交哈希
+        for commit in $COMMITS; do
+          echo "Processing commit: $commit"
+          
+          # 尝试获取完整哈希
+          FULL_HASH=$(git rev-parse "$commit" 2>/dev/null || echo "")
+          
+          if [ -n "$FULL_HASH" ]; then
+            echo "Resolved $commit -> $FULL_HASH"
+            FULL_HASHES="$FULL_HASHES $FULL_HASH"
+            RESOLVED_COMMITS="$RESOLVED_COMMITS$FULL_HASH"$'\n'
+            
+            # 获取提交信息用于验证
+            COMMIT_SUBJECT=$(git show -s --format="%s" $FULL_HASH 2>/dev/null || echo "Unknown commit")
+            echo "Commit subject: $COMMIT_SUBJECT"
+          else
+            echo "❌ Error: Cannot resolve commit $commit"
+            exit 1
+          fi
+          echo "---"
+        done
+        
+        # 保存解析后的提交哈希
+        FULL_HASHES=$(echo $FULL_HASHES | sed 's/^ *//;s/ *$//')
+        echo "full_hashes=$FULL_HASHES" >> $GITHUB_OUTPUT
+        
+        # 保存到文件供后续步骤使用
+        echo "$RESOLVED_COMMITS" | grep -v '^$' > ../resolved_commits.txt
+        
+        echo "✅ Resolved commits: $FULL_HASHES"
+
+    - name: Analyze file changes from commits
+      id: analyze-files
+      run: |
+        cd source-repo
+        
+        # 读取解析后的提交列表
+        COMMITS=$(cat ../resolved_commits.txt)
+        
+        ALL_MODIFIED_FILES=""
+        ALL_DELETED_FILES=""
+        COMMIT_INFO=""
+        
+        # 处理每个提交，只分析文件信息，不复制文件
+        for commit in $COMMITS; do
+          echo "=== Analyzing commit: $commit ==="
+          
+          # 获取提交信息
+          COMMIT_SUBJECT=$(git show -s --format="%s" $commit)
+          COMMIT_DATE=$(git show -s --format="%ci" $commit)
+          echo "Subject: $COMMIT_SUBJECT"
+          echo "Date: $COMMIT_DATE"
+          
+          # 获取该提交中的文件变更
+          MODIFIED_FILES=$(git show --name-status --format= $commit | awk '$1 == "A" || $1 == "M" {print $2}' | sort -u)
+          DELETED_FILES=$(git show --name-status --format= $commit | awk '$1 == "D" {print $2}' | sort -u)
+          
+          echo "Modified/Added: $(echo $MODIFIED_FILES | tr '\n' ' ')"
+          echo "Deleted: $(echo $DELETED_FILES | tr '\n' ' ')"
+          
+          # 累积文件列表（去重）
+          if [ -n "$MODIFIED_FILES" ]; then
+            ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$MODIFIED_FILES"
+          fi
+          
+          if [ -n "$DELETED_FILES" ]; then
+            ALL_DELETED_FILES="$ALL_DELETED_FILES"$'\n'"$DELETED_FILES"
+          fi
+          
+          # 记录提交信息
+          COMMIT_INFO="${COMMIT_INFO}Commit: $commit"$'\n'
+          COMMIT_INFO="${COMMIT_INFO}Subject: $COMMIT_SUBJECT"$'\n'
+          COMMIT_INFO="${COMMIT_INFO}Date: $COMMIT_DATE"$'\n'
+          COMMIT_INFO="${COMMIT_INFO}Modified: $(echo $MODIFIED_FILES | tr '\n' ' ')"$'\n'
+          COMMIT_INFO="${COMMIT_INFO}Deleted: $(echo $DELETED_FILES | tr '\n' ' ')"$'\n'$'\n'
+          
+          echo "---"
+        done
+        
+        # 去重文件列表
+        UNIQUE_MODIFIED=$(echo "$ALL_MODIFIED_FILES" | grep -v '^$' | sort -u | tr '\n' ' ')
+        UNIQUE_DELETED=$(echo "$ALL_DELETED_FILES" | grep -v '^$' | sort -u | tr '\n' ' ')
+        
+        echo "modified_files=$UNIQUE_MODIFIED" >> $GITHUB_OUTPUT
+        echo "deleted_files=$UNIQUE_DELETED" >> $GITHUB_OUTPUT
+        
+        # 保存文件列表
+        echo "$UNIQUE_MODIFIED" | tr ' ' '\n' | grep -v '^$' > ../modified_files.txt
+        echo "$UNIQUE_DELETED" | tr ' ' '\n' | grep -v '^$' > ../deleted_files.txt
+        echo "$COMMIT_INFO" > ../commit_info.txt
+        
+        echo "✅ Unique modified files ($(echo "$UNIQUE_MODIFIED" | wc -w)): $UNIQUE_MODIFIED"
+        echo "✅ Unique deleted files ($(echo "$UNIQUE_DELETED" | wc -w)): $UNIQUE_DELETED"
+
+    - name: Copy files from source repository (latest state)
+      id: copy-files
+      run: |
+        cd source-repo
+        
+        # 确保在最新状态（当前分支的最新提交）
+        git checkout ${{ inputs.source_branch }} --quiet
+        echo "Using latest state of branch: ${{ inputs.source_branch }}"
+        
+        # 创建临时目录用于打包文件
+        mkdir -p ../file-package
+        
+        # 从最新源仓库复制文件
+        if [ -s ../modified_files.txt ]; then
+          echo "=== Copying files from latest source repository ==="
+          
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              echo "Copying: $file"
+              mkdir -p "../file-package/$(dirname "$file")"
+              cp "$file" "../file-package/$file"
+            elif [ -n "$file" ] && [ ! -f "$file" ]; then
+              echo "⚠️ Warning: File not found in latest source: $file"
+            fi
+          done < ../modified_files.txt
+        else
+          echo "No files to copy"
+        fi
+        
+        # 创建删除文件记录
+        if [ -s ../deleted_files.txt ]; then
+          echo "=== Creating deleted files record ==="
+          echo "# Deleted Files Record" > ../file-package/DELETED_FILES.md
+          echo "" >> ../file-package/DELETED_FILES.md
+          echo "The following files were deleted in the analyzed commits:" >> ../file-package/DELETED_FILES.md
+          echo "" >> ../file-package/DELETED_FILES.md
+          
+          # 记录每个提交中删除的文件
+          COMMITS=$(cat ../resolved_commits.txt)
+          for commit in $COMMITS; do
+            COMMIT_DELETED=$(cd source-repo && git show --name-status --format= $commit 2>/dev/null | awk '$1 == "D" {print $2}' | tr '\n' ' ')
+            if [ -n "$COMMIT_DELETED" ]; then
+              COMMIT_SUBJECT=$(cd source-repo && git show -s --format="%s" $commit)
+              echo "## $commit ($COMMIT_SUBJECT)" >> ../file-package/DELETED_FILES.md
+              echo "$COMMIT_DELETED" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- /' >> ../file-package/DELETED_FILES.md
+              echo "" >> ../file-package/DELETED_FILES.md
+            fi
+          done
+        fi
+        
+        # 创建提交信息文件
+        cat > ../file-package/COMMIT_INFO.md << EOF
+        # File Extraction Information
+        
+        ## Source Commits Analyzed
+        - Repository: ${{ env.SOURCE_REPO }}
+        - Branch: ${{ inputs.source_branch }}
+        - Commits: $(cat ../resolved_commits.txt | tr '\n' ' ')
+        
+        ## File Summary
+        - Files copied from latest source: $(cat ../modified_files.txt | wc -l)
+        - Files marked as deleted in commits: $(cat ../deleted_files.txt | wc -l)
+        
+        ## Extraction Details
+        - Extraction date: $(date)
+        - Target commit message: ${{ env.COMMIT_MESSAGE }}
+        - Files were copied from the latest state of the source repository, not from specific commits.
+        EOF
+        
+        echo "✅ File package created from latest source state"
+
+    - name: Copy package to target repository
+      run: |
+        # 复制打包的文件到目标仓库
+        if [ -d "../file-package" ] && [ -n "$(ls -A ../file-package 2>/dev/null)" ]; then
+          echo "Copying files to target repository..."
+          cp -r ../file-package/* target-repo/
+          
+          # 显示复制的文件结构
+          echo "=== Files copied to target repo ==="
+          find target-repo -type f -not -path '*/\.git/*' | while read file; do
+            echo "  📄 $file"
+          done | head -30
+        else
+          echo "No files to copy"
+        fi
+
+    - name: Commit package to target repository
+      id: commit-package
+      run: |
+        cd target-repo
+        
+        # 检查是否有文件变更
+        if git diff --quiet && git diff --cached --quiet; then
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+          echo "No changes to commit"
+        else
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # 添加所有文件
+          git add .
+          
+          # 创建详细的提交信息
+          COMMIT_LIST=$(cat ../resolved_commits.txt | tr '\n' ' ')
+          FILE_COUNT=$(cat ../modified_files.txt | wc -l)
+          DELETED_COUNT=$(cat ../deleted_files.txt | wc -l)
+          
+          git commit -m "${{ env.COMMIT_MESSAGE }}" \
+            -m "${{ env.COMMIT_DESCRIPTION }}" \
+            -m "" \
+            -m "Files analyzed from commits: $COMMIT_LIST" \
+            -m "Source repository: ${{ env.SOURCE_REPO }}@${{ inputs.source_branch }}" \
+            -m "Files copied from latest source: $FILE_COUNT" \
+            -m "Files deleted in analyzed commits: $DELETED_COUNT" \
+            -m "" \
+            -m "Note: Files were copied from the latest state of the source repository," \
+            -m "based on file changes identified in the specified commits."
+          
+          echo "✅ Commit created successfully"
+        fi
+
+    - name: Push to target repository
+      if: steps.commit-package.outputs.has_changes == 'true'
+      run: |
+        cd target-repo
+        git push origin ${{ inputs.target_branch }}
+        echo "✅ Changes pushed to ${{ env.TARGET_REPO }}:${{ inputs.target_branch }}"
+
+    - name: Generate workflow summary
+      run: |
+        COMMIT_COUNT=$(cat ../resolved_commits.txt | wc -l)
+        MODIFIED_COUNT=$(cat ../modified_files.txt | wc -l)
+        DELETED_COUNT=$(cat ../deleted_files.txt | wc -l)
+        
+        cat > $GITHUB_STEP_SUMMARY << EOF
+        # File Extraction Summary
+        
+        ## Source Information
+        - Repository: \`${{ env.SOURCE_REPO }}\`
+        - Branch: \`${{ inputs.source_branch }}\`
+        - Commits analyzed: \`$COMMIT_COUNT\`
+        
+        ## Target Information  
+        - Repository: \`${{ env.TARGET_REPO }}\`
+        - Branch: \`${{ inputs.target_branch }}\`
+        
+        ## File Processing
+        - Files copied from latest source: \`$MODIFIED_COUNT\`
+        - Files marked as deleted: \`$DELETED_COUNT\`
+        
+        ## Processed Commits
+        \`\`\`
+        $(cat ../resolved_commits.txt | sed 's/^/• /')
+        \`\`\`
+        
+        ## Important Note
+        ⚠️ Files were copied from the **latest state** of \`${{ inputs.source_branch }}\` branch,  
+        based on file changes identified in the specified commits.
+        
+        ## Result
+        EOF
+        
+        if [ "${{ steps.commit-package.outputs.has_changes }}" = "true" ]; then
+          echo "✅ Successfully analyzed $COMMIT_COUNT commit(s) and copied $MODIFIED_COUNT files from latest source" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ No changes were made (files already exist)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Archive artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: extraction-artifacts-${{ github.run_id }}
+        path: |
+          file-package/
+          resolved_commits.txt
+          modified_files.txt
+          deleted_files.txt
+          commit_info.txt
+        retention-days: 7
