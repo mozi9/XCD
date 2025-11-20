@@ -19,8 +19,6 @@ on:
 env:
   SOURCE_REPO: "YangQi0408/kernel_xiaomi_sm8250_mod"
   TARGET_REPO: "mozi9/XCD"
-  COMMIT_AUTHOR: "mozi9"
-  COMMIT_EMAIL: "mozi9"
   COMMIT_MESSAGE: "fs: Bump SuSFS version to v2.0.0"
   COMMIT_DESCRIPTION: "https://gitlab.com/simonpunk/susfs4ksu/-/commit/a5e7449c5f31d4f01377a4ce4e324bec57053e6e"
 
@@ -46,444 +44,191 @@ jobs:
         path: target-repo
         fetch-depth: 0
 
-    - name: Setup Git identity
+    - name: Setup Git identity (mozi9)
       run: |
-        git config --global user.name "${{ env.COMMIT_AUTHOR }}"
-        git config --global user.email "${{ env.COMMIT_EMAIL }}"
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
+        echo "Git configured: mozi9 <mozi9>"
 
     - name: Resolve commit hashes
       id: resolve-commits
       run: |
         cd source-repo
-        
-        # 清理输入，分割多个提交哈希
         COMMITS=$(echo "${{ inputs.source_commits }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
-        
-        FULL_HASHES=""
         RESOLVED_COMMITS=""
         
-        echo "Input commits: $COMMITS"
-        
-        # 解析每个提交哈希
         for commit in $COMMITS; do
-          echo "Processing commit: $commit"
-          
-          # 尝试获取完整哈希
           FULL_HASH=$(git rev-parse "$commit" 2>/dev/null || echo "")
-          
           if [ -n "$FULL_HASH" ]; then
-            echo "Resolved $commit -> $FULL_HASH"
-            FULL_HASHES="$FULL_HASHES $FULL_HASH"
             RESOLVED_COMMITS="$RESOLVED_COMMITS$FULL_HASH"$'\n'
-            
-            # 获取提交信息用于验证
-            COMMIT_SUBJECT=$(git show -s --format="%s" $FULL_HASH 2>/dev/null || echo "Unknown commit")
-            echo "Commit subject: $COMMIT_SUBJECT"
           else
             echo "❌ Error: Cannot resolve commit $commit"
             exit 1
           fi
-          echo "---"
         done
         
-        # 保存解析后的提交哈希
-        FULL_HASHES=$(echo $FULL_HASHES | sed 's/^ *//;s/ *$//')
-        echo "full_hashes=$FULL_HASHES" >> $GITHUB_OUTPUT
-        
-        # 保存到文件供后续步骤使用
         echo "$RESOLVED_COMMITS" | grep -v '^$' > ../resolved_commits.txt
-        
-        echo "✅ Resolved commits: $FULL_HASHES"
+        echo "✅ Resolved commits: $(cat ../resolved_commits.txt | tr '\n' ' ')"
 
-    - name: Analyze file changes from commits
+    - name: Analyze file changes
       id: analyze-files
       run: |
         cd source-repo
-        
-        # 读取解析后的提交列表
         COMMITS=$(cat ../resolved_commits.txt)
         
         ALL_MODIFIED_FILES=""
         ALL_DELETED_FILES=""
-        COMMIT_INFO=""
         
-        # 统计变量
-        TOTAL_FILES_FOUND=0
-        DUPLICATE_COUNT=0
-        UNIQUE_FILE_COUNT=0
+        echo "=== Analyzing file changes ==="
         
-        echo "=== Analyzing file changes from commits ==="
-        
-        # 处理每个提交，只分析文件信息，不复制文件
         for commit in $COMMITS; do
-          echo "=== Analyzing commit: $commit ==="
+          echo "Processing commit: $commit"
           
-          # 获取提交信息
-          COMMIT_SUBJECT=$(git show -s --format="%s" $commit)
-          COMMIT_DATE=$(git show -s --format="%ci" $commit)
-          echo "Subject: $COMMIT_SUBJECT"
-          echo "Date: $COMMIT_DATE"
-          
-          # 获取该提交中的文件变更
           MODIFIED_FILES=$(git show --name-status --format= $commit | awk '$1 == "A" || $1 == "M" {print $2}' | sort -u)
           DELETED_FILES=$(git show --name-status --format= $commit | awk '$1 == "D" {print $2}' | sort -u)
           
-          # 统计文件数量
-          MOD_COUNT=$(echo "$MODIFIED_FILES" | grep -c . || true)
-          DEL_COUNT=$(echo "$DELETED_FILES" | grep -c . || true)
-          TOTAL_FILES_FOUND=$((TOTAL_FILES_FOUND + MOD_COUNT))
-          
-          echo "Modified/Added files: $MOD_COUNT"
-          echo "Deleted files: $DEL_COUNT"
-          echo "Files: $(echo $MODIFIED_FILES | tr '\n' ' ')"
-          
-          # 累积文件列表
           if [ -n "$MODIFIED_FILES" ]; then
             ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$MODIFIED_FILES"
           fi
-          
           if [ -n "$DELETED_FILES" ]; then
             ALL_DELETED_FILES="$ALL_DELETED_FILES"$'\n'"$DELETED_FILES"
           fi
-          
-          # 记录提交信息
-          COMMIT_INFO="${COMMIT_INFO}Commit: $commit"$'\n'
-          COMMIT_INFO="${COMMIT_INFO}Subject: $COMMIT_SUBJECT"$'\n'
-          COMMIT_INFO="${COMMIT_INFO}Date: $COMMIT_DATE"$'\n'
-          COMMIT_INFO="${COMMIT_INFO}Modified: $MOD_COUNT files"$'\n'
-          COMMIT_INFO="${COMMIT_INFO}Deleted: $DEL_COUNT files"$'\n'$'\n'
-          
-          echo "---"
         done
         
-        # 去重文件列表并统计
+        # 去重文件列表
         UNIQUE_MODIFIED=$(echo "$ALL_MODIFIED_FILES" | grep -v '^$' | sort -u)
         UNIQUE_DELETED=$(echo "$ALL_DELETED_FILES" | grep -v '^$' | sort -u)
         
-        UNIQUE_FILE_COUNT=$(echo "$UNIQUE_MODIFIED" | grep -c . || true)
-        DELETED_FILE_COUNT=$(echo "$UNIQUE_DELETED" | grep -c . || true)
-        DUPLICATE_COUNT=$((TOTAL_FILES_FOUND - UNIQUE_FILE_COUNT))
-        
-        # 输出统计信息
-        echo "=== File Analysis Summary ==="
-        echo "📊 Total files found in commits: $TOTAL_FILES_FOUND"
-        echo "🔄 Duplicate files removed: $DUPLICATE_COUNT"
-        echo "✅ Unique files to process: $UNIQUE_FILE_COUNT"
-        echo "🗑️ Deleted files recorded: $DELETED_FILE_COUNT"
-        echo "📝 Final files to copy: $UNIQUE_FILE_COUNT"
-        
-        # 保存到输出变量
-        echo "total_files=$TOTAL_FILES_FOUND" >> $GITHUB_OUTPUT
-        echo "duplicate_files=$DUPLICATE_COUNT" >> $GITHUB_OUTPUT
-        echo "unique_files=$UNIQUE_FILE_COUNT" >> $GITHUB_OUTPUT
-        echo "deleted_files_count=$DELETED_FILE_COUNT" >> $GITHUB_OUTPUT
-        echo "modified_files=$(echo "$UNIQUE_MODIFIED" | tr '\n' ' ')" >> $GITHUB_OUTPUT
-        echo "deleted_files=$(echo "$UNIQUE_DELETED" | tr '\n' ' ')" >> $GITHUB_OUTPUT
-        
-        # 保存文件列表
         echo "$UNIQUE_MODIFIED" > ../modified_files.txt
         echo "$UNIQUE_DELETED" > ../deleted_files.txt
-        echo "$COMMIT_INFO" > ../commit_info.txt
         
-        # 保存每个提交的删除文件信息
-        for commit in $COMMITS; do
-          COMMIT_SUBJECT=$(git show -s --format="%s" $commit)
-          COMMIT_DELETED=$(git show --name-status --format= $commit 2>/dev/null | awk '$1 == "D" {print $2}' | sort -u | tr '\n' ' ')
-          if [ -n "$COMMIT_DELETED" ]; then
-            echo "COMMIT:$commit" >> ../deleted_files_by_commit.txt
-            echo "SUBJECT:$COMMIT_SUBJECT" >> ../deleted_files_by_commit.txt
-            echo "FILES:$COMMIT_DELETED" >> ../deleted_files_by_commit.txt
-            echo "---" >> ../deleted_files_by_commit.txt
-          fi
-        done
+        MOD_COUNT=$(echo "$UNIQUE_MODIFIED" | grep -c . || echo 0)
+        DEL_COUNT=$(echo "$UNIQUE_DELETED" | grep -c . || echo 0)
+        
+        echo "modified_files_count=$MOD_COUNT" >> $GITHUB_OUTPUT
+        echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+        
+        echo "✅ Modified files: $MOD_COUNT"
+        echo "✅ Deleted files: $DEL_COUNT"
 
-    - name: Copy files from source repository (latest state)
-      id: copy-files
-      run: |
-        cd source-repo
-        
-        # 确保在最新状态（当前分支的最新提交）
-        git checkout ${{ inputs.source_branch }} --quiet
-        echo "Using latest state of branch: ${{ inputs.source_branch }}"
-        
-        # 创建临时目录用于打包文件
-        mkdir -p ../file-package
-        
-        # 从最新源仓库复制文件
-        if [ -s ../modified_files.txt ]; then
-          echo "=== Copying files from latest source repository ==="
-          COPIED_COUNT=0
-          MISSING_COUNT=0
-          
-          while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "$file" ]; then
-              echo "📄 Copying: $file"
-              mkdir -p "../file-package/$(dirname "$file")"
-              cp "$file" "../file-package/$file"
-              COPIED_COUNT=$((COPIED_COUNT + 1))
-            elif [ -n "$file" ] && [ ! -f "$file" ]; then
-              echo "⚠️ Warning: File not found in latest source: $file"
-              MISSING_COUNT=$((MISSING_COUNT + 1))
-            fi
-          done < ../modified_files.txt
-          
-          echo "=== Copy Summary ==="
-          echo "✅ Successfully copied: $COPIED_COUNT files"
-          echo "❌ Files not found: $MISSING_COUNT files"
-          echo "📊 Expected total: ${{ steps.analyze-files.outputs.unique_files }} files"
-        else
-          echo "No files to copy"
-        fi
-        
-        # 创建删除文件记录
-        if [ -s ../deleted_files_by_commit.txt ]; then
-          echo "=== Creating deleted files record ==="
-          echo "# Deleted Files Record" > ../file-package/DELETED_FILES.md
-          echo "" >> ../file-package/DELETED_FILES.md
-          echo "The following files were deleted in the analyzed commits:" >> ../file-package/DELETED_FILES.md
-          echo "" >> ../file-package/DELETED_FILES.md
-          
-          CURRENT_COMMIT=""
-          CURRENT_SUBJECT=""
-          
-          while IFS= read -r line; do
-            if [[ "$line" == COMMIT:* ]]; then
-              CURRENT_COMMIT="${line#COMMIT:}"
-            elif [[ "$line" == SUBJECT:* ]]; then
-              CURRENT_SUBJECT="${line#SUBJECT:}"
-            elif [[ "$line" == FILES:* ]]; then
-              FILES="${line#FILES:}"
-              if [ -n "$CURRENT_COMMIT" ] && [ -n "$FILES" ]; then
-                echo "## $CURRENT_COMMIT ($CURRENT_SUBJECT)" >> ../file-package/DELETED_FILES.md
-                echo "$FILES" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- /' >> ../file-package/DELETED_FILES.md
-                echo "" >> ../file-package/DELETED_FILES.md
-              fi
-            fi
-          done < ../deleted_files_by_commit.txt
-        fi
-        
-        # 创建提交信息文件
-        cat > ../file-package/COMMIT_INFO.md << EOF
-        # File Extraction Information
-        
-        ## Source Commits Analyzed
-        - Repository: ${{ env.SOURCE_REPO }}
-        - Branch: ${{ inputs.source_branch }}
-        - Commits processed: $(cat ../resolved_commits.txt | wc -l)
-        
-        ## File Statistics
-        - Total files found in commits: ${{ steps.analyze-files.outputs.total_files }}
-        - Duplicate files removed: ${{ steps.analyze-files.outputs.duplicate_files }}
-        - Unique files processed: ${{ steps.analyze-files.outputs.unique_files }}
-        - Deleted files recorded: ${{ steps.analyze-files.outputs.deleted_files_count }}
-        
-        ## Extraction Details
-        - Extraction date: $(date)
-        - Target commit message: ${{ env.COMMIT_MESSAGE }}
-        EOF
-
-    - name: Copy package to target repository
-      run: |
-        # 复制打包的文件到目标仓库
-        if [ -d "../file-package" ] && [ -n "$(ls -A ../file-package 2>/dev/null)" ]; then
-          echo "Copying files to target repository..."
-          cp -r ../file-package/* target-repo/
-          
-          echo "=== Files structure in target repo ==="
-          find target-repo -type f -not -path '*/\.git/*' | while read file; do
-            echo "  📄 $file"
-          done | head -20
-        else
-          echo "No files to copy"
-        fi
-
-    - name: Delete files from target repository based on deletion info
+    - name: Delete target files first
       id: delete-files
       run: |
         cd target-repo
         
-        echo "=== Processing file deletions from source commits ==="
-        
+        echo "=== Deleting files from target ==="
         DELETED_COUNT=0
-        NOT_FOUND_COUNT=0
-        SKIPPED_COUNT=0
         
-        # 检查是否有删除文件需要处理
         if [ -s ../deleted_files.txt ]; then
-          echo "Files marked for deletion in source commits:"
-          cat ../deleted_files.txt
-          echo ""
-          
-          # 处理每个要删除的文件
           while IFS= read -r file; do
-            if [ -n "$file" ]; then
-              if [ -f "$file" ]; then
-                # 安全删除：先检查文件是否在目标仓库中存在且不是关键文件
-                if [[ "$file" == / || "$file" == /* || "$file" == .* || "$file" == "." || "$file" == ".." ]]; then
-                  echo "🚫 SKIPPED: Safety check failed for '$file' - potentially dangerous path"
-                  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                elif [[ "$file" == *.git* ]]; then
-                  echo "🚫 SKIPPED: Skipping Git directory/file '$file'"
-                  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                else
-                  echo "🗑️ DELETING: $file"
-                  rm -f "$file"
-                  DELETED_COUNT=$((DELETED_COUNT + 1))
-                  
-                  # 尝试删除空目录
-                  dir=$(dirname "$file")
-                  if [ -d "$dir" ] && [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
-                    rmdir "$dir" 2>/dev/null && echo "  📁 Removed empty directory: $dir" || true
-                  fi
-                fi
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              # 安全检查
+              if [[ "$file" != / && "$file" != /* && "$file" != .git* && "$file" != "." && "$file" != ".." ]]; then
+                echo "🗑️ Deleting: $file"
+                rm -f "$file"
+                DELETED_COUNT=$((DELETED_COUNT + 1))
               else
-                echo "ℹ️ NOT FOUND: $file (not in target repository)"
-                NOT_FOUND_COUNT=$((NOT_FOUND_COUNT + 1))
+                echo "🚫 Skipped (safety): $file"
               fi
             fi
           done < ../deleted_files.txt
-        else
-          echo "No files to delete (empty deletion list)"
         fi
         
-        echo "=== Deletion Summary ==="
-        echo "✅ Successfully deleted: $DELETED_COUNT files"
-        echo "ℹ️ Not found in target: $NOT_FOUND_COUNT files"
-        echo "🚫 Skipped (safety): $SKIPPED_COUNT files"
-        echo "📊 Total processed: $((DELETED_COUNT + NOT_FOUND_COUNT + SKIPPED_COUNT)) files"
-        
-        # 保存统计信息
-        echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
-        echo "not_found_count=$NOT_FOUND_COUNT" >> $GITHUB_OUTPUT
-        echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+        echo "actual_deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+        echo "✅ Deleted $DELETED_COUNT files"
 
-    - name: Commit package to target repository
-      id: commit-package
+    - name: Copy modified files to target
+      id: copy-files
+      run: |
+        cd source-repo
+        git checkout ${{ inputs.source_branch }} --quiet
+        
+        echo "=== Copying modified files ==="
+        COPIED_COUNT=0
+        
+        if [ -s ../modified_files.txt ]; then
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              echo "📄 Copying: $file"
+              mkdir -p "../target-repo/$(dirname "$file")"
+              cp "$file" "../target-repo/$file"
+              COPIED_COUNT=$((COPIED_COUNT + 1))
+            fi
+          done < ../modified_files.txt
+        fi
+        
+        echo "actual_copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
+        echo "✅ Copied $COPIED_COUNT files"
+
+    - name: Verify file operations
+      id: verify-files
+      run: |
+        echo "=== Verification ==="
+        echo "Expected to copy: $(cat modified_files.txt | wc -l) files"
+        echo "Expected to delete: $(cat deleted_files.txt | wc -l) files"
+        echo "Actually copied: ${{ steps.copy-files.outputs.actual_copied_count }} files"
+        echo "Actually deleted: ${{ steps.delete-files.outputs.actual_deleted_count }} files"
+        
+        cd target-repo
+        echo "Files in target repo: $(find . -type f -not -path '*/\.git/*' | wc -l)"
+        echo "Git status:"
+        git status --short
+
+    - name: Commit changes (simple message)
+      id: commit-changes
       run: |
         cd target-repo
         
-        # 检查是否有文件变更（包括删除）
-        if git diff --quiet && git diff --cached --quiet; then
+        # 检查变更
+        git add -A
+        if git diff --cached --quiet; then
+          echo "❌ No changes to commit"
           echo "has_changes=false" >> $GITHUB_OUTPUT
-          echo "No changes to commit"
+          # 调试信息
+          echo "=== Debug info ==="
+          git status
+          find . -type f -not -path '*/\.git/*' | head -10
+          exit 1
         else
           echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "=== Files to commit ==="
+          git diff --cached --name-only
           
-          # 添加所有变更（包括删除的文件）
-          git add -A -f
-          
-          # 创建详细的提交信息
-          COMMIT_LIST=$(cat ../resolved_commits.txt | tr '\n' ' ')
-          
-          git commit -m "${{ env.COMMIT_MESSAGE }}" \
-            -m "${{ env.COMMIT_DESCRIPTION }}" \
-            -m "" \
-            -m "Files analyzed from commits: $COMMIT_LIST" \
-            -m "Source repository: ${{ env.SOURCE_REPO }}@${{ inputs.source_branch }}" \
-            -m "File statistics:" \
-            -m "- Total found: ${{ steps.analyze-files.outputs.total_files }} files" \
-            -m "- Duplicates removed: ${{ steps.analyze-files.outputs.duplicate_files }} files" \
-            -m "- Files added/modified: ${{ steps.analyze-files.outputs.unique_files }} files" \
-            -m "- Files deleted from target: ${{ steps.delete-files.outputs.deleted_count }} files" \
-            -m "- Files not found for deletion: ${{ steps.delete-files.outputs.not_found_count }} files" \
-            -m "- Files skipped (safety): ${{ steps.delete-files.outputs.skipped_count }} files" \
-            -m "" \
-            -m "Note: File operations based on source commit analysis."
-          
-          echo "✅ Commit created successfully"
+          # 简单提交信息
+          git commit -m "${{ env.COMMIT_MESSAGE }}" -m "${{ env.COMMIT_DESCRIPTION }}"
+          echo "✅ Commit created"
         fi
 
-    - name: Force push to target repository (overwrite conflicts)
-      if: steps.commit-package.outputs.has_changes == 'true'
+    - name: Push to target repository
+      if: steps.commit-changes.outputs.has_changes == 'true'
       run: |
         cd target-repo
-        
-        # 强制推送，用源文件覆盖任何冲突
-        echo "Pushing changes to target repository (force if necessary)..."
-        
-        # 先尝试正常推送
-        if git push origin ${{ inputs.target_branch }}; then
-          echo "✅ Changes pushed successfully"
-        else
-          echo "⚠️ Normal push failed, attempting force push..."
-          # 如果正常推送失败，强制推送（用源文件覆盖）
-          git push --force-with-lease origin ${{ inputs.target_branch }}
-          echo "✅ Changes force-pushed successfully (source files overwrote conflicts)"
-        fi
+        git push origin ${{ inputs.target_branch }}
+        echo "✅ Pushed to ${{ env.TARGET_REPO }}:${{ inputs.target_branch }}"
 
-    - name: Generate workflow summary
+    - name: Show final result
       run: |
-        COMMIT_COUNT=$(cat ../resolved_commits.txt | wc -l)
-        MODIFIED_COUNT=${{ steps.analyze-files.outputs.unique_files }}
-        DELETED_COUNT=${{ steps.delete-files.outputs.deleted_count }}
-        NOT_FOUND_COUNT=${{ steps.delete-files.outputs.not_found_count }}
-        SKIPPED_COUNT=${{ steps.delete-files.outputs.skipped_count }}
-        TOTAL_FOUND=${{ steps.analyze-files.outputs.total_files }}
-        DUPLICATES=${{ steps.analyze-files.outputs.duplicate_files }}
-        
         cat > $GITHUB_STEP_SUMMARY << EOF
-        # File Extraction and Deletion Summary
+        # 文件处理结果
         
-        ## 📊 File Statistics
-        | Metric | Count |
-        |--------|-------|
-        | Commits analyzed | $COMMIT_COUNT |
-        | Total files found | $TOTAL_FOUND |
-        | Duplicate files removed | $DUPLICATES |
-        | Unique files processed | $MODIFIED_COUNT |
-        | Files deleted from target | $DELETED_COUNT |
-        | Files not found for deletion | $NOT_FOUND_COUNT |
-        | Files skipped (safety) | $SKIPPED_COUNT |
+        ## 操作统计
+        - **分析出的修改文件**: ${{ steps.analyze-files.outputs.modified_files_count }} 个
+        - **分析出的删除文件**: ${{ steps.analyze-files.outputs.deleted_files_count }} 个
+        - **实际复制的文件**: ${{ steps.copy-files.outputs.actual_copied_count }} 个
+        - **实际删除的文件**: ${{ steps.delete-files.outputs.actual_deleted_count }} 个
         
-        ## 🔄 Processing Summary
-        - **Files found in commits**: $TOTAL_FOUND
-        - **After deduplication**: $MODIFIED_COUNT files copied
-        - **Files deleted from target**: $DELETED_COUNT
-        - **Safety checks**: $SKIPPED_COUNT files skipped
+        ## Git配置
+        - **作者**: mozi9
+        - **邮箱**: mozi9
         
-        ## ⚡ File Operations
-        ### ✅ Added/Modified
-        - Copied $MODIFIED_COUNT files from source repository
-        - Source files overwrite target files in case of conflicts
+        ## 提交信息
+        - **标题**: ${{ env.COMMIT_MESSAGE }}
+        - **描述**: ${{ env.COMMIT_DESCRIPTION }}
         
-        ### 🗑️ Deleted (Safe Deletion)
-        - Deleted $DELETED_COUNT files that were removed in source commits
-        - $NOT_FOUND_COUNT files not found in target (safe to ignore)
-        - $SKIPPED_COUNT files skipped due to safety checks
-        - **No recursive directory deletion** - only specific files
-        
-        ## 📋 Processed Commits
-        \`\`\`
-        $(cat ../resolved_commits.txt | sed 's/^/• /')
-        \`\`\`
-        
-        ## 🔒 Safety Features
-        - Path safety checks prevent accidental deletion
-        - Git directories and system paths are protected
-        - Only specific files are deleted, not entire directories
-        - Empty directories are cleaned up after file deletion
-        
-        ## Result
         EOF
         
-        if [ "${{ steps.commit-package.outputs.has_changes }}" = "true" ]; then
-          echo "✅ **SUCCESS**: Processed $COMMIT_COUNT commit(s)" >> $GITHUB_STEP_SUMMARY
-          echo "- 📥 Added/Modified: $MODIFIED_COUNT files" >> $GITHUB_STEP_SUMMARY
-          echo "- 📤 Deleted: $DELETED_COUNT files" >> $GITHUB_STEP_SUMMARY
-          echo "- 🔒 Safe operation: No recursive deletion" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.commit-changes.outputs.has_changes }}" = "true" ]; then
+          echo "✅ **成功**: 正确处理了 ${{ steps.copy-files.outputs.actual_copied_count }} 个文件" >> $GITHUB_STEP_SUMMARY
         else
-          echo "ℹ️ No changes were made (files already exist)" >> $GITHUB_STEP_SUMMARY
+          echo "❌ **失败**: 没有检测到文件变更" >> $GITHUB_STEP_SUMMARY
         fi
-
-    - name: Archive artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: extraction-artifacts-${{ github.run_id }}
-        path: |
-          file-package/
-          resolved_commits.txt
-          modified_files.txt
-          deleted_files.txt
-          deleted_files_by_commit.txt
-          commit_info.txt
-        retention-days: 7
