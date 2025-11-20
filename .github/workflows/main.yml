@@ -86,11 +86,11 @@ jobs:
             exit 1
           fi
 
-      - name: 检出目标仓库
+      - name: 检出目标仓库（使用PAT认证）
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.parse_url.outputs.target_full_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: 配置Git身份信息
@@ -98,10 +98,13 @@ jobs:
           git config --global user.name "mozi9"
           git config --global user.email "mozi9"
           git config --global push.default simple
+          # 配置Git使用PAT进行认证
+          git config --global credential.helper store
+          echo "https://mozi9:${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com" > ~/.git-credentials
 
       - name: 添加源仓库远程并获取指定分支
         run: |
-          git remote add source https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.source_full_name }}.git
+          git remote add source https://${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.source_full_name }}.git
           git fetch source ${{ steps.parse_url.outputs.source_branch }}
 
       - name: 执行拉取仓库分支操作
@@ -128,7 +131,8 @@ jobs:
             export GIT_COMMITTER_EMAIL="mozi9"
           ' -- --all
           
-          git push -u origin $NEW_BRANCH --force
+          # 使用PAT令牌推送
+          git push https://mozi9:${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.target_full_name }}.git $NEW_BRANCH --force
 
       - name: 执行合并特定提交操作
         if: ${{ github.event.inputs.operation_type == '合并特定提交' }}
@@ -145,7 +149,7 @@ jobs:
           fi
           
           git checkout $TARGET_BRANCH
-          git pull origin $TARGET_BRANCH
+          git pull https://mozi9:${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.target_full_name }}.git $TARGET_BRANCH
           
           COMMIT_HASH="${{ github.event.inputs.source_commit }}"
           if ! git cat-file -e $COMMIT_HASH^0; then
@@ -164,11 +168,7 @@ jobs:
                   echo "使用源版本解决冲突..."
                   
                   # 清理所有冲突残留文件
-                  find . -name "*.orig" -delete
-                  find . -name "*.BACKUP" -delete
-                  find . -name "*.BASE" -delete
-                  find . -name "*.LOCAL" -delete
-                  find . -name "*.REMOTE" -delete
+                  find . -name "*.orig" -delete 2>/dev/null || true
                   
                   # 获取所有冲突文件
                   CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
@@ -180,7 +180,6 @@ jobs:
                     for file in $CONFLICT_FILES; do
                       if [ -f "$file" ]; then
                         echo "使用源版本解决: $file"
-                        # 使用源版本（theirs）
                         git checkout --theirs -- "$file"
                         git add "$file"
                       fi
@@ -191,12 +190,10 @@ jobs:
                   git status --porcelain | while read status file; do
                     case "$status" in
                       UD|DU)
-                        # 删除/修改冲突，使用源版本（删除文件）
                         echo "删除文件: $file"
                         git rm "$file" 2>/dev/null || true
                         ;;
                       DD)
-                        # 双方都删除，直接跳过
                         echo "双方都删除的文件: $file"
                         ;;
                     esac
@@ -209,35 +206,28 @@ jobs:
                 "自动使用目标版本")
                   echo "使用目标版本解决冲突..."
                   
-                  # 清理所有冲突残留文件
-                  find . -name "*.orig" -delete
+                  find . -name "*.orig" -delete 2>/dev/null || true
                   
-                  # 获取所有冲突文件
                   CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
                   if [ -n "$CONFLICT_FILES" ]; then
                     echo "冲突文件列表:"
                     echo "$CONFLICT_FILES"
                     
-                    # 对每个冲突文件使用目标版本
                     for file in $CONFLICT_FILES; do
                       if [ -f "$file" ]; then
                         echo "使用目标版本解决: $file"
-                        # 使用目标版本（ours）
                         git checkout --ours -- "$file"
                         git add "$file"
                       fi
                     done
                   fi
                   
-                  # 继续cherry-pick
                   git cherry-pick --continue
                   ;;
                   
                 *)
                   echo "冲突需要手动解决"
-                  echo "冲突文件列表:"
                   git status --porcelain
-                  echo "请手动解决冲突后，运行: git add/rm <文件> 然后 git cherry-pick --continue"
                   exit 1
                   ;;
               esac
@@ -252,7 +242,9 @@ jobs:
             
             # 重写作者信息
             git commit --amend --author="mozi9 <mozi9>" --no-edit
-            git push origin $TARGET_BRANCH
+            
+            # 使用PAT令牌推送
+            git push https://mozi9:${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ steps.parse_url.outputs.target_full_name }}.git $TARGET_BRANCH
             echo "✅ 合并提交操作完成"
           fi
 
@@ -279,12 +271,8 @@ jobs:
         if: always()
         run: |
           git remote remove source || true
-          # 最终清理所有冲突文件
           find . -name "*.orig" -delete 2>/dev/null || true
-          find . -name "*.BACKUP" -delete 2>/dev/null || true
-          find . -name "*.BASE" -delete 2>/dev/null || true
-          find . -name "*.LOCAL" -delete 2>/dev/null || true
-          find . -name "*.REMOTE" -delete 2>/dev/null || true
+          rm -f ~/.git-credentials || true
 
       - name: 生成操作摘要
         run: |
@@ -294,6 +282,5 @@ jobs:
           echo "源仓库: ${{ steps.parse_url.outputs.source_full_name }}"
           echo "源分支: ${{ steps.parse_url.outputs.source_branch }}"
           echo "目标仓库: ${{ steps.parse_url.outputs.target_full_name }}"
-          echo "冲突解决策略: ${{ github.event.inputs.conflict_resolution }}"
           echo "操作时间: $(date)"
           echo "================================"
