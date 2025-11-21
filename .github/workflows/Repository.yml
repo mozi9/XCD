@@ -1,115 +1,59 @@
-name: Sync Repository and Create Branch
+name: Create Pull Request
 
 on:
   workflow_dispatch:
     inputs:
-      source_repo_url:
-        description: '源仓库完整URL (格式: https://github.com/owner/repo 或 https://github.com/owner/repo/tree/branch-name)'
+      target_branch:
+        description: '目标分支名称'
         required: true
-        default: 'https://github.com/mozi9/kernel_xiaomi_sm8250'
+        default: 'susfs'
       target_repo:
         description: '目标仓库 (格式: owner/repo)'
         required: true
-        default: 'mozi9/XCD'
-      new_branch:
-        description: '要创建的新分支名称'
-        required: true
-        default: 'susfs'
+        default: 'mozi9/FW'
+      pr_title:
+        description: 'Pull Request标题'
+        required: false
+        default: '自动同步更新'
+      pr_body:
+        description: 'Pull Request描述'
+        required: false
+        default: '自动创建的Pull Request'
 
 jobs:
-  sync-repositories:
+  create-pull-request:
     runs-on: ubuntu-latest
     steps:
-    - name: Parse source repository URL and branch
-      id: parse_url
-      run: |
-        # 提取源仓库owner和name
-        if [[ "${{ github.event.inputs.source_repo_url }}" =~ https://github.com/([^/]+)/([^/]+) ]]; then
-          REPO_OWNER="${BASH_REMATCH[1]}"
-          REPO_NAME="${BASH_REMATCH[2]}"
-          echo "source_owner=$REPO_OWNER" >> $GITHUB_OUTPUT
-          echo "source_repo=$REPO_NAME" >> $GITHUB_OUTPUT
-          echo "source_full_repo=$REPO_OWNER/$REPO_NAME" >> $GITHUB_OUTPUT
-        else
-          echo "错误: 无效的GitHub URL格式"
-          exit 1
-        fi
-        
-        # 检查是否指定了分支
-        if [[ "${{ github.event.inputs.source_repo_url }}" =~ /tree/([^/]+)$ ]]; then
-          BRANCH_NAME="${BASH_REMATCH[1]}"
-          echo "source_branch=$BRANCH_NAME" >> $GITHUB_OUTPUT
-          echo "branch_type=custom" >> $GITHUB_OUTPUT
-        else
-          echo "branch_type=default" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Get source default branch if not specified
-      id: get_default_branch
-      if: steps.parse_url.outputs.branch_type == 'default'
-      run: |
-        DEFAULT_BRANCH=$(curl -s -H "Authorization: token ${{ secrets.Mozi9_PAT }}" \
-          https://api.github.com/repos/${{ steps.parse_url.outputs.source_full_repo }} | jq -r .default_branch)
-        echo "source_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
-
-    - name: Checkout target repository
+    - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.event.inputs.target_repo }}
-        token: ${{ secrets.Mozi9_PAT }}
         fetch-depth: 0
 
     - name: Configure Git
       run: |
         git config user.name "GitHub Actions"
         git config user.email "actions@github.com"
+        git config --global http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n ${GITHUB_ACTOR}:${GITHUB_TOKEN} | base64)"
 
-    - name: Add source repository as remote
+    - name: Create or update branch
       run: |
-        git remote add source https://${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse_url.outputs.source_full_repo }}.git
-        git fetch source
-
-    - name: Create and switch to new branch
-      run: |
-        # 验证源分支是否存在
-        if git show-ref --verify --quiet refs/remotes/source/${{ steps.parse_url.outputs.source_branch }}; then
-          git checkout -b ${{ github.event.inputs.new_branch }} source/${{ steps.parse_url.outputs.source_branch }}
-          echo "分支 '${{ github.event.inputs.new_branch }}' 创建成功，基于源分支 '${{ steps.parse_url.outputs.source_branch }}'"
-        else
-          echo "错误: 源分支 '${{ steps.parse_url.outputs.source_branch }}' 不存在"
-          exit 1
-        fi
-
-    - name: Push to target repository
-      run: |
-        git push -u origin ${{ github.event.inputs.new_branch }}
+        git checkout -b ${{ github.event.inputs.target_branch }}
+        # 这里可以添加您的更改
+        git commit --allow-empty -m "初始化 ${{ github.event.inputs.target_branch }} 分支"
+        git push origin ${{ github.event.inputs.target_branch }} --force
 
     - name: Create Pull Request
-      id: create_pr
       uses: peter-evans/create-pull-request@v5
       with:
-        token: ${{ secrets.Mozi9_PAT }}
-        title: "Sync from ${{ steps.parse_url.outputs.source_full_repo }} - ${{ steps.parse_url.outputs.source_branch }}"
-        body: |
-          自动同步来自 ${{ github.event.inputs.source_repo_url }} 的代码
-          
-          **同步信息:**
-          - 源仓库: ${{ steps.parse_url.outputs.source_full_repo }}
-          - 源分支: ${{ steps.parse_url.outputs.source_branch }}
-          - 目标分支: ${{ github.event.inputs.new_branch }}
-          - 同步时间: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-        branch: ${{ github.event.inputs.new_branch }}
-        base: main  # 可以根据需要修改为基础分支
-
-    - name: Cleanup
-      run: |
-        git remote remove source
-
-    - name: Output synchronization information
-      run: |
-        echo "=== 同步完成 ==="
-        echo "源仓库: ${{ steps.parse_url.outputs.source_full_repo }}"
-        echo "源分支: ${{ steps.parse_url.outputs.source_branch }}"
-        echo "目标仓库: ${{ github.event.inputs.target_repo }}"
-        echo "新分支: ${{ github.event.inputs.new_branch }}"
-        echo "Pull Request: ${{ steps.create_pr.outputs.pull-request-url }}"
+        token: ${{ secrets.GITHUB_TOKEN }}
+        title: ${{ github.event.inputs.pr_title }}
+        body: ${{ github.event.inputs.pr_body }}
+        branch: ${{ github.event.inputs.target_branch }}
+        base: main
+        delete-branch: false
+        commit-message: "更新 ${{ github.event.inputs.target_branch }} 分支"
+        author: "GitHub Actions <actions@github.com>"
+        committer: "GitHub Actions <actions@github.com>"
+        labels: |
+          automated
+          sync
