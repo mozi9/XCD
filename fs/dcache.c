@@ -31,7 +31,6 @@
 #include <linux/bit_spinlock.h>
 #include <linux/rculist_bl.h>
 #include <linux/list_lru.h>
-
 #include "internal.h"
 #include "mount.h"
 
@@ -2273,6 +2272,7 @@ struct dentry *__d_lookup(const struct dentry *parent, const struct qstr *name)
 
 		if (dentry->d_name.hash != hash)
 			continue;
+
 		spin_lock(&dentry->d_lock);
 		if (dentry->d_parent != parent)
 			goto next;
