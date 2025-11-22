@@ -6,21 +6,21 @@ on:
       source_commits:
         description: "Source commit hashes (short or full, comma separated)"
         required: true
-        default: "a5e7449c5f31d4f01377a4ce4e324bec57053e6e"
+        default: "fa957cb,5a3d762,ec4727b,5f7f1a5,061e1be"
       source_branch:
         description: "Source branch to get commits from"
         required: true
-        default: "susfs-2.0.0"
+        default: "android16-aptusitu-new"
       target_branch:
         description: "Target branch to push to"
         required: true
-        default: "susfs"
+        default: "miuix"
 
 env:
-  SOURCE_REPO: "YangQi0408/kernel_xiaomi_sm8250_mod"
+  SOURCE_REPO: "ApartTUSITU/kernel_xiaomi_sm8250_mod"
   TARGET_REPO: "mozi9/XCD"
   COMMIT_MESSAGE: "fs: Bump SuSFS version to v2.0.0"
-  COMMIT_DESCRIPTION: "https://gitlab.com/simonpunk/susfs4ksu/-/commit/a5e7449c5f31d4f01377a4ce4e324bec57053e6e"
+  COMMIT_DESCRIPTION: "Co-authored-by: simonpunk <simonpunk2016@gmail.com> o-authored-by: JackA1ltman <cs2dtzq@163.com>"
 
 jobs:
   extract-and-commit:
