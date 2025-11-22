@@ -6,7 +6,7 @@ on:
       source_commits:
         description: "Source commit hashes (short or full, comma separated)"
         required: true
-        default: "fa957cb,5a3d762,ec4727b,5f7f1a5,061e1be"
+        default: "75fef37,fa957cb,5a3d762,ec4727b,5f7f1a5,061e1be"
       source_branch:
         description: "Source branch to get commits from"
         required: true
