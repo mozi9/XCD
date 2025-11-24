@@ -3,24 +3,34 @@ name: Manual SusFS File Extraction and Commit
 on:
   workflow_dispatch:
     inputs:
-      source_commits:
-        description: "Source commit hashes (short or full, comma separated)"
+      source_repo:
+        description: "Source repository (owner/repo)"
         required: true
-        default: "41273ce"
+        default: "sqldown/android_kernel_common_android12-5.10"
       source_branch:
         description: "Source branch to get commits from"
         required: true
         default: "android_kernel_common_android12-5.10"
+      source_commits:
+        description: "Source commit hashes (short or full, comma separated)"
+        required: true
+        default: "41273ce"
+      target_repo:
+        description: "Target repository (owner/repo)"
+        required: true
+        default: "mozi9/XCD"
       target_branch:
         description: "Target branch to push to"
         required: true
         default: "miuix"
-
-env:
-  SOURCE_REPO: "sqldown/android_kernel_common_android12-5.10"
-  TARGET_REPO: "mozi9/XCD"
-  COMMIT_MESSAGE: "fs: Bump SuSFS version to v2.0.0"
-  COMMIT_DESCRIPTION: "Co-authored-by: simonpunk <simonpunk2016@gmail.com> o-authored-by: JackA1ltman <cs2dtzq@163.com>"
+      commit_message:
+        description: "Commit message title"
+        required: true
+        default: "fs: Bump SuSFS version to v2.0.0"
+      commit_description:
+        description: "Commit description"
+        required: false
+        default: "Co-authored-by: simonpunk <simonpunk2016@gmail.com>\nCo-authored-by: JackA1ltman <cs2dtzq@163.com>"
 
 jobs:
   extract-and-commit:
@@ -29,26 +39,26 @@ jobs:
     - name: Checkout source repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ env.SOURCE_REPO }}
+        repository: ${{ inputs.source_repo }}
         ref: ${{ inputs.source_branch }}
-        token: ${{ secrets.Mozi9_PAT }}
+        token: ${{ secrets.GITHUB_TOKEN }}
         path: source-repo
         fetch-depth: 0
 
     - name: Checkout target repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ env.TARGET_REPO }}
+        repository: ${{ inputs.target_repo }}
         ref: ${{ inputs.target_branch }}
-        token: ${{ secrets.Mozi9_PAT }}
+        token: ${{ secrets.GITHUB_TOKEN }}
         path: target-repo
         fetch-depth: 0
 
-    - name: Setup Git identity (mozi9)
+    - name: Setup Git identity
       run: |
-        git config --global user.name "mozi9"
-        git config --global user.email "mozi9"
-        echo "Git configured: mozi9 <mozi9>"
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        echo "Git configured"
 
     - name: Resolve commit hashes
       id: resolve-commits
@@ -95,7 +105,6 @@ jobs:
           fi
         done
         
-        # 去重文件列表
         UNIQUE_MODIFIED=$(echo "$ALL_MODIFIED_FILES" | grep -v '^$' | sort -u)
         UNIQUE_DELETED=$(echo "$ALL_DELETED_FILES" | grep -v '^$' | sort -u)
         
@@ -122,7 +131,6 @@ jobs:
         if [ -s ../deleted_files.txt ]; then
           while IFS= read -r file; do
             if [ -n "$file" ] && [ -f "$file" ]; then
-              # 安全检查
               if [[ "$file" != / && "$file" != /* && "$file" != .git* && "$file" != "." && "$file" != ".." ]]; then
                 echo "🗑️ Deleting: $file"
                 rm -f "$file"
@@ -160,42 +168,23 @@ jobs:
         echo "actual_copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
         echo "✅ Copied $COPIED_COUNT files"
 
-    - name: Verify file operations
-      id: verify-files
-      run: |
-        echo "=== Verification ==="
-        echo "Expected to copy: $(cat modified_files.txt | wc -l) files"
-        echo "Expected to delete: $(cat deleted_files.txt | wc -l) files"
-        echo "Actually copied: ${{ steps.copy-files.outputs.actual_copied_count }} files"
-        echo "Actually deleted: ${{ steps.delete-files.outputs.actual_deleted_count }} files"
-        
-        cd target-repo
-        echo "Files in target repo: $(find . -type f -not -path '*/\.git/*' | wc -l)"
-        echo "Git status:"
-        git status --short
-
-    - name: Commit changes (simple message)
+    - name: Commit changes
       id: commit-changes
       run: |
         cd target-repo
         
-        # 检查变更
         git add -A
         if git diff --cached --quiet; then
           echo "❌ No changes to commit"
           echo "has_changes=false" >> $GITHUB_OUTPUT
-          # 调试信息
-          echo "=== Debug info ==="
-          git status
-          find . -type f -not -path '*/\.git/*' | head -10
           exit 1
         else
           echo "has_changes=true" >> $GITHUB_OUTPUT
           echo "=== Files to commit ==="
           git diff --cached --name-only
           
-          # 简单提交信息
-          git commit -m "${{ env.COMMIT_MESSAGE }}" -m "${{ env.COMMIT_DESCRIPTION }}"
+          # 构建提交信息
+          git commit -m "${{ inputs.commit_message }}" -m "${{ inputs.commit_description }}"
           echo "✅ Commit created"
         fi
 
@@ -204,12 +193,18 @@ jobs:
       run: |
         cd target-repo
         git push origin ${{ inputs.target_branch }}
-        echo "✅ Pushed to ${{ env.TARGET_REPO }}:${{ inputs.target_branch }}"
+        echo "✅ Pushed to ${{ inputs.target_repo }}:${{ inputs.target_branch }}"
 
     - name: Show final result
       run: |
         cat > $GITHUB_STEP_SUMMARY << EOF
         # 文件处理结果
+        
+        ## 仓库配置
+        - **源仓库**: ${{ inputs.source_repo }}
+        - **源分支**: ${{ inputs.source_branch }}
+        - **目标仓库**: ${{ inputs.target_repo }}
+        - **目标分支**: ${{ inputs.target_branch }}
         
         ## 操作统计
         - **分析出的修改文件**: ${{ steps.analyze-files.outputs.modified_files_count }} 个
@@ -217,18 +212,14 @@ jobs:
         - **实际复制的文件**: ${{ steps.copy-files.outputs.actual_copied_count }} 个
         - **实际删除的文件**: ${{ steps.delete-files.outputs.actual_deleted_count }} 个
         
-        ## Git配置
-        - **作者**: mozi9
-        - **邮箱**: mozi9
-        
         ## 提交信息
-        - **标题**: ${{ env.COMMIT_MESSAGE }}
-        - **描述**: ${{ env.COMMIT_DESCRIPTION }}
+        - **标题**: ${{ inputs.commit_message }}
+        - **描述**: ${{ inputs.commit_description }}
         
         EOF
         
         if [ "${{ steps.commit-changes.outputs.has_changes }}" = "true" ]; then
-          echo "✅ **成功**: 正确处理了 ${{ steps.copy-files.outputs.actual_copied_count }} 个文件" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **成功**: 已提交更改并推送到目标仓库" >> $GITHUB_STEP_SUMMARY
         else
           echo "❌ **失败**: 没有检测到文件变更" >> $GITHUB_STEP_SUMMARY
         fi
