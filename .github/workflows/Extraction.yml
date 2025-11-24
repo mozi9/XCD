@@ -6,18 +6,18 @@ on:
       source_commits:
         description: "Source commit hashes (short or full, comma separated)"
         required: true
-        default: "75fef37,fa957cb,5a3d762,ec4727b,5f7f1a5,061e1be"
+        default: "41273ce"
       source_branch:
         description: "Source branch to get commits from"
         required: true
-        default: "android16-aptusitu-new"
+        default: "android_kernel_common_android12-5.10"
       target_branch:
         description: "Target branch to push to"
         required: true
         default: "miuix"
 
 env:
-  SOURCE_REPO: "ApartTUSITU/kernel_xiaomi_sm8250_mod"
+  SOURCE_REPO: "sqldown/android_kernel_common_android12-5.10"
   TARGET_REPO: "mozi9/XCD"
   COMMIT_MESSAGE: "fs: Bump SuSFS version to v2.0.0"
   COMMIT_DESCRIPTION: "Co-authored-by: simonpunk <simonpunk2016@gmail.com> o-authored-by: JackA1ltman <cs2dtzq@163.com>"
