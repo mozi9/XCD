@@ -3,30 +3,10 @@ name: Smart File Extraction and Commit
 on:
   workflow_dispatch:
     inputs:
-      source_type:
-        description: "源类型"
-        required: true
-        type: choice
-        options:
-          - commit_url
-          - repo_branch
-        default: commit_url
       commit_urls:
         description: "GitHub提交链接（多个链接用逗号或换行分隔）"
-        required: false
-        default: ""
-      source_repo:
-        description: "源仓库（格式：owner/repo）"
-        required: false
-        default: "ApartTUSITU/kernel_xiaomi_sm8250_mod"
-      source_commits:
-        description: "源仓库提交哈希（多个用逗号分隔）"
-        required: false
-        default: "47b6de7"
-      source_branch:
-        description: "源分支"
-        required: false
-        default: "android16-aptusitu-new"
+        required: true
+        default: "https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod/commit/47b6de7"
       target_repo:
         description: "目标仓库（格式：owner/repo）"
         required: true
@@ -51,33 +31,22 @@ env:
 jobs:
   smart-file-extraction:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
     - name: 🔍 验证输入参数
       id: validate-inputs
       run: |
         echo "=== 文件提取 ==="
-        echo "源类型: ${{ github.event.inputs.source_type }}"
+        echo "提交链接: ${{ github.event.inputs.commit_urls }}"
         
-        if [ "${{ github.event.inputs.source_type }}" = "commit_url" ]; then
-          echo "提交链接: ${{ github.event.inputs.commit_urls }}"
-          if [[ -z "${{ github.event.inputs.commit_urls }}" ]]; then
-            echo "❌ 提交链接不能为空"
-            exit 1
-          fi
-        else
-          echo "源仓库: ${{ github.event.inputs.source_repo }}"
-          echo "提交哈希: ${{ github.event.inputs.source_commits }}"
-          echo "源分支: ${{ github.event.inputs.source_branch }}"
-          
-          if [[ -z "${{ github.event.inputs.source_repo }}" ]]; then
-            echo "❌ 源仓库不能为空"
-            exit 1
-          fi
-          if [[ -z "${{ github.event.inputs.source_commits }}" ]]; then
-            echo "❌ 提交哈希不能为空"
-            exit 1
-          fi
+        if [[ -z "${{ github.event.inputs.commit_urls }}" ]]; then
+          echo "❌ 提交链接不能为空"
+          exit 1
+        fi
+        
+        if [[ -z "${{ github.event.inputs.target_repo }}" ]]; then
+          echo "❌ 目标仓库不能为空"
+          exit 1
         fi
         
         echo "✅ 参数验证通过"
@@ -97,104 +66,71 @@ jobs:
         path: target-repo
         fetch-depth: 1
 
-    - name: 🔍 解析提交信息
-      id: parse-commits
+    - name: 🔍 解析提交链接
+      id: parse-commit-urls
       run: |
-        echo "=== 解析提交信息 ==="
+        echo "=== 解析提交链接 ==="
         
-        if [ "${{ github.event.inputs.source_type }}" = "commit_url" ]; then
-          # 处理多个提交链接
-          COMMIT_URLS="${{ github.event.inputs.commit_urls }}"
-          echo "解析提交链接: $COMMIT_URLS"
+        COMMIT_URLS="${{ github.event.inputs.commit_urls }}"
+        echo "原始输入: $COMMIT_URLS"
+        
+        # 清理和分割链接（支持逗号、空格、换行分隔）
+        COMMIT_URLS_CLEAN=$(echo "$COMMIT_URLS" | tr ',' '\n' | tr ' ' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+        URL_COUNT=$(echo "$COMMIT_URLS_CLEAN" | wc -l)
+        
+        echo "发现 $URL_COUNT 个提交链接"
+        
+        # 存储所有提交信息
+        all_commits=()
+        all_repos=()
+        unique_repos=()
+        
+        url_index=0
+        while IFS= read -r commit_url; do
+          url_index=$((url_index + 1))
+          echo "处理链接 $url_index/$URL_COUNT: $commit_url"
           
-          # 清理和分割链接（支持逗号、空格、换行分隔）
-          COMMIT_URLS_CLEAN=$(echo "$COMMIT_URLS" | tr ',' '\n' | tr ' ' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
-          URL_COUNT=$(echo "$COMMIT_URLS_CLEAN" | wc -l)
-          
-          echo "发现 $URL_COUNT 个提交链接"
-          
-          # 存储所有提交信息
-          all_commits=()
-          all_repos=()
-          
-          url_index=0
-          while IFS= read -r commit_url; do
-            url_index=$((url_index + 1))
-            echo "处理链接 $url_index/$URL_COUNT: $commit_url"
+          # 提取仓库和提交哈希
+          if [[ "$commit_url" =~ https://github.com/([^/]+)/([^/]+)/commit/([a-f0-9]+) ]]; then
+            REPO_OWNER="${BASH_REMATCH[1]}"
+            REPO_NAME="${BASH_REMATCH[2]}"
+            COMMIT_HASH="${BASH_REMATCH[3]}"
+            REPO="$REPO_OWNER/$REPO_NAME"
             
-            # 提取仓库和提交哈希
-            if [[ "$commit_url" =~ https://github.com/([^/]+)/([^/]+)/commit/([a-f0-9]+) ]]; then
-              REPO_OWNER="${BASH_REMATCH[1]}"
-              REPO_NAME="${BASH_REMATCH[2]}"
-              COMMIT_HASH="${BASH_REMATCH[3]}"
-              REPO="$REPO_OWNER/$REPO_NAME"
-              
-              echo "✅ 解析成功: $REPO @ $COMMIT_HASH"
-              
-              # 添加到数组
-              all_commits+=("$COMMIT_HASH")
-              all_repos+=("$REPO")
-            else
-              echo "❌ 链接格式错误: $commit_url"
-              exit 1
-            fi
-          done <<< "$COMMIT_URLS_CLEAN"
-          
-          if [ ${#all_commits[@]} -eq 0 ]; then
-            echo "❌ 没有有效的提交链接"
-            exit 1
-          fi
-          
-          # 保存结果
-          printf "%s\n" "${all_commits[@]}" > commit_hashes.txt
-          printf "%s\n" "${all_repos[@]}" > repo_names.txt
-          
-          echo "commits_count=${#all_commits[@]}" >> $GITHUB_OUTPUT
-          echo "✅ 解析完成: ${#all_commits[@]} 个提交"
-          
-        else
-          # 处理多个提交哈希（仓库分支方式）
-          REPO="${{ github.event.inputs.source_repo }}"
-          COMMITS="${{ github.event.inputs.source_commits }}"
-          BRANCH="${{ github.event.inputs.source_branch }}"
-          
-          echo "处理多个提交哈希: $COMMITS"
-          
-          # 清理和分割提交哈希
-          COMMITS_CLEAN=$(echo "$COMMITS" | tr ',' '\n' | tr ' ' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
-          COMMIT_COUNT=$(echo "$COMMITS_CLEAN" | wc -l)
-          
-          echo "发现 $COMMIT_COUNT 个提交哈希"
-          
-          # 存储所有提交信息
-          all_commits=()
-          all_repos=()
-          
-          while IFS= read -r commit_hash; do
-            echo "处理提交: $commit_hash"
-            all_commits+=("$commit_hash")
+            echo "✅ 解析成功: $REPO @ $COMMIT_HASH"
+            
+            # 添加到数组
+            all_commits+=("$COMMIT_HASH")
             all_repos+=("$REPO")
-          done <<< "$COMMITS_CLEAN"
-          
-          if [ ${#all_commits[@]} -eq 0 ]; then
-            echo "❌ 没有有效的提交哈希"
+            
+            # 记录唯一仓库
+            if [[ ! " ${unique_repos[@]} " =~ " ${REPO} " ]]; then
+              unique_repos+=("$REPO")
+            fi
+          else
+            echo "❌ 链接格式错误: $commit_url"
+            echo "💡 正确格式: https://github.com/owner/repo/commit/哈希"
             exit 1
           fi
-          
-          # 保存结果
-          printf "%s\n" "${all_commits[@]}" > commit_hashes.txt
-          printf "%s\n" "${all_repos[@]}" > repo_names.txt
-          
-          echo "commits_count=${#all_commits[@]}" >> $GITHUB_OUTPUT
-          echo "source_repo=$REPO" >> $GITHUB_OUTPUT
-          echo "source_branch=$BRANCH" >> $GITHUB_OUTPUT
-          echo "✅ 解析完成: ${#all_commits[@]} 个提交"
+        done <<< "$COMMIT_URLS_CLEAN"
+        
+        if [ ${#all_commits[@]} -eq 0 ]; then
+          echo "❌ 没有有效的提交链接"
+          exit 1
         fi
+        
+        # 保存结果
+        printf "%s\n" "${all_commits[@]}" > commit_hashes.txt
+        printf "%s\n" "${all_repos[@]}" > repo_names.txt
+        
+        echo "commits_count=${#all_commits[@]}" >> $GITHUB_OUTPUT
+        echo "unique_repos_count=${#unique_repos[@]}" >> $GITHUB_OUTPUT
+        echo "✅ 解析完成: ${#all_commits[@]} 个提交，${#unique_repos[@]} 个仓库"
 
-    - name: 📄 获取所有提交的文件列表
-      id: get-all-files
+    - name: 📄 获取提交文件列表
+      id: get-commit-files
       run: |
-        echo "=== 获取所有提交的文件列表 ==="
+        echo "=== 获取提交文件列表 ==="
         
         # 读取提交和仓库信息
         readarray -t COMMITS < commit_hashes.txt
@@ -248,18 +184,8 @@ jobs:
             
             # 添加文件到总列表（去重）
             while IFS= read -r file; do
-              if [ -n "$file" ]; then
-                # 检查是否已存在
-                found=0
-                for existing_file in "${all_files[@]}"; do
-                  if [ "$existing_file" = "$file" ]; then
-                    found=1
-                    break
-                  fi
-                done
-                if [ $found -eq 0 ]; then
-                  all_files+=("$file")
-                fi
+              if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
+                all_files+=("$file")
               fi
             done <<< "$files"
             
@@ -279,13 +205,12 @@ jobs:
         printf "%s\n" "${processed_commits[@]}" > processed_commits.txt
         
         echo "files_count=${#all_files[@]}" >> $GITHUB_OUTPUT
-        echo "processed_commits_count=${#processed_commits[@]}" >> $GITHUB_OUTPUT
         echo "✅ 总共发现 ${#all_files[@]} 个唯一文件"
 
-    - name: 📥 下载所有文件
-      id: download-all-files
+    - name: 📥 下载文件
+      id: download-files
       run: |
-        echo "=== 下载所有文件 ==="
+        echo "=== 下载文件 ==="
         
         if [ ! -s all_files.txt ]; then
           echo "❌ 没有需要下载的文件"
@@ -303,7 +228,9 @@ jobs:
         
         # 使用第一个提交的仓库信息
         FIRST_REPO="${REPOS[0]}"
+        FIRST_COMMIT="${COMMITS[0]}"
         echo "使用仓库: $FIRST_REPO"
+        echo "使用提交: $FIRST_COMMIT"
         
         # 创建源文件目录
         mkdir -p source-files
@@ -312,17 +239,19 @@ jobs:
         downloaded=0
         errors=0
         
-        echo "开始下载 ${#all_files[@]} 个文件..."
+        # 获取文件总数
+        readarray -t FILES < all_files.txt
+        TOTAL_FILES=${#FILES[@]}
         
-        # 下载每个文件（使用第一个提交的版本）
+        echo "开始下载 $TOTAL_FILES 个文件..."
+        
+        # 下载每个文件
         while IFS= read -r file; do
           [ -z "$file" ] && continue
           
-          # 使用第一个提交的哈希
-          COMMIT="${COMMITS[0]}"
-          raw_url="https://raw.githubusercontent.com/$FIRST_REPO/$COMMIT/$file"
+          raw_url="https://raw.githubusercontent.com/$FIRST_REPO/$FIRST_COMMIT/$file"
           
-          echo "⬇️ 下载 ($((downloaded + 1))/${#all_files[@]}): $file"
+          echo "⬇️ 下载 ($((downloaded + 1))/$TOTAL_FILES): $file"
           
           # 创建目录结构
           mkdir -p "source-files/$(dirname "$file")"
@@ -337,9 +266,6 @@ jobs:
           
         done < all_files.txt
         
-        echo "actual_downloaded=$downloaded" >> $GITHUB_OUTPUT
-        echo "download_errors=$errors" >> $GITHUB_OUTPUT
-        
         if [ $errors -gt 0 ]; then
           echo "❌ 文件下载完成: $downloaded 成功, $errors 失败"
           exit 1
@@ -347,13 +273,13 @@ jobs:
           echo "✅ 文件下载完成: $downloaded 个文件"
         fi
 
-    - name: 🔄 同步文件到目标仓库
-      id: sync-files
+    - name: 🔄 复制文件到目标仓库
+      id: copy-files
       run: |
-        echo "=== 同步文件到目标仓库 ==="
+        echo "=== 复制文件到目标仓库 ==="
         
         if [ ! -s all_files.txt ]; then
-          echo "❌ 没有需要同步的文件"
+          echo "❌ 没有需要复制的文件"
           exit 1
         fi
         
@@ -361,9 +287,13 @@ jobs:
         copied=0
         errors=0
         
-        echo "开始同步 ${#all_files[@]} 个文件..."
+        # 获取文件总数
+        readarray -t FILES < all_files.txt
+        TOTAL_FILES=${#FILES[@]}
         
-        # 同步每个文件
+        echo "开始复制 $TOTAL_FILES 个文件..."
+        
+        # 复制每个文件
         while IFS= read -r file; do
           [ -z "$file" ] && continue
           
@@ -375,7 +305,7 @@ jobs:
             if cp "source-files/$file" "target-repo/$file"; then
               copied=$((copied + 1))
               if [ $((copied % 10)) -eq 0 ]; then
-                echo "📄 已复制 $copied/${#all_files[@]} 个文件"
+                echo "📄 已复制 $copied/$TOTAL_FILES 个文件"
               fi
             else
               echo "❌ 复制失败: $file"
@@ -387,56 +317,60 @@ jobs:
           fi
         done < all_files.txt
         
-        echo "actual_copied=$copied" >> $GITHUB_OUTPUT
-        echo "sync_errors=$errors" >> $GITHUB_OUTPUT
-        
         if [ $errors -gt 0 ]; then
-          echo "❌ 文件同步完成: $copied 成功, $errors 失败"
+          echo "❌ 文件复制完成: $copied 成功, $errors 失败"
           exit 1
         else
-          echo "✅ 文件同步完成: $copied 个文件"
+          echo "✅ 文件复制完成: $copied 个文件"
         fi
 
-    - name: 💾 创建提交
-      id: create-commit
+    - name: 💾 提交变更
+      id: commit-changes
       run: |
         cd target-repo
         
-        echo "=== 检查变更并提交 ==="
+        echo "=== 提交变更 ==="
         
-        # 检查是否有文件变更
+        # 检查是否有变更
         if git diff-index --quiet HEAD --; then
           echo "❌ 没有检测到文件变更"
           exit 1
-        else
-          echo "📝 发现变更，准备提交..."
-          
-          git add -A
-          
-          # 显示变更摘要
-          echo "=== 变更摘要 ==="
-          git status --short | head -20
-          echo "... (更多文件)"
-          
-          # 创建提交信息
-          readarray -t PROCESSED_COMMITS < processed_commits.txt
-          COMMIT_COUNT=${#PROCESSED_COMMITS[@]}
-          
-          commit_msg="${{ github.event.inputs.commit_title }}"
-          commit_msg="$commit_msg"$'\n'$'\n'"来自 $COMMIT_COUNT 个提交:"
-          
-          for commit in "${PROCESSED_COMMITS[@]}"; do
-            commit_msg="$commit_msg"$'\n'"- ${commit:0:8}"
-          done
-          
-          if [ -n "${{ github.event.inputs.commit_description }}" ]; then
-            commit_msg="$commit_msg"$'\n'$'\n'"${{ github.event.inputs.commit_description }}"
-          fi
-          
-          # 提交
-          git commit -m "$commit_msg"
-          echo "✅ 提交创建成功"
         fi
+        
+        echo "📝 发现变更，准备提交..."
+        
+        git add -A
+        
+        # 显示变更摘要
+        echo "=== 变更文件 ==="
+        git status --short | head -15
+        TOTAL_CHANGES=$(git status --short | wc -l)
+        if [ $TOTAL_CHANGES -gt 15 ]; then
+          echo "... (还有 $((TOTAL_CHANGES - 15)) 个文件)"
+        fi
+        
+        # 创建提交信息
+        COMMIT_COUNT="${{ steps.parse-commit-urls.outputs.commits_count }}"
+        
+        commit_msg="${{ github.event.inputs.commit_title }}"
+        commit_msg="$commit_msg"$'\n'$'\n'"来自 $COMMIT_COUNT 个提交"
+        
+        # 添加提交列表
+        if [ -f processed_commits.txt ] && [ -s processed_commits.txt ]; then
+          commit_msg="$commit_msg"$'\n'"提交哈希:"
+          while IFS= read -r commit; do
+            [ -z "$commit" ] && continue
+            commit_msg="$commit_msg"$'\n'"- ${commit:0:8}"
+          done < processed_commits.txt
+        fi
+        
+        if [ -n "${{ github.event.inputs.commit_description }}" ]; then
+          commit_msg="$commit_msg"$'\n'$'\n'"${{ github.event.inputs.commit_description }}"
+        fi
+        
+        # 提交
+        git commit -m "$commit_msg"
+        echo "✅ 提交创建成功"
 
     - name: 🚀 推送更改
       run: |
@@ -459,22 +393,22 @@ jobs:
       if: always()
       run: |
         cat > "$GITHUB_STEP_SUMMARY" << EOF
-        # 多提交文件提取结果
+        # 文件提取完成
         
         ## 执行摘要
-        - **源类型**: ${{ github.event.inputs.source_type }}
-        - **处理提交数量**: ${{ steps.parse-commits.outputs.commits_count }}
-        - **发现唯一文件数量**: ${{ steps.get-all-files.outputs.files_count }}
-        - **下载成功文件**: ${{ steps.download-all-files.outputs.actual_downloaded }}
-        - **同步成功文件**: ${{ steps.sync-files.outputs.actual_copied }}
+        - **处理提交数量**: ${{ steps.parse-commit-urls.outputs.commits_count || '0' }}
+        - **涉及仓库数量**: ${{ steps.parse-commit-urls.outputs.unique_repos_count || '0' }}
+        - **发现文件数量**: ${{ steps.get-commit-files.outputs.files_count || '0' }}
+        - **目标仓库**: ${{ github.event.inputs.target_repo }} (${{ github.event.inputs.target_branch }})
         - **状态**: ✅ 成功
         
         ## 提交信息
         EOF
         
         # 添加提交列表到报告
-        if [ -f processed_commits.txt ]; then
+        if [ -f processed_commits.txt ] && [ -s processed_commits.txt ]; then
           while IFS= read -r commit; do
+            [ -z "$commit" ] && continue
             echo "- \`${commit:0:8}\`" >> "$GITHUB_STEP_SUMMARY"
           done < processed_commits.txt
         fi
@@ -482,20 +416,16 @@ jobs:
         cat >> "$GITHUB_STEP_SUMMARY" << EOF
         
         ## 使用方法
-        **提交链接方式**（多个链接用逗号分隔）:
+        直接粘贴GitHub提交链接，支持多个链接：
         \`\`\`
         https://github.com/owner1/repo1/commit/abc123
         https://github.com/owner2/repo2/commit/def456
+        https://github.com/owner1/repo1/commit/ghi789
         \`\`\`
         
-        **仓库分支方式**（多个提交用逗号分隔）:
-        \`\`\`
-        仓库: owner/repo
-        提交: abc123,def456,ghi789
-        分支: main
-        \`\`\`
+        **支持格式**: 逗号、空格或换行分隔
         
-        **执行时间**: 预计2-3分钟
+        **执行时间**: 预计1-2分钟
         EOF
 
     - name: 🧹 清理临时文件
@@ -503,5 +433,5 @@ jobs:
       run: |
         echo "=== 清理临时文件 ==="
         rm -rf source-files
-        rm -f commit_hashes.txt repo_names.txt all_files.txt processed_commits.txt
+        rm -f commit_hashes.txt repo_names.txt all_files.txt processed_commits.txt 2>/dev/null || true
         echo "✅ 清理完成"
