@@ -48,6 +48,7 @@ jobs:
         echo "源仓库: ${{ github.event.inputs.source_repo }}"
         echo "目标仓库: ${{ github.event.inputs.target_repo }}"
         echo "提交哈希: ${{ github.event.inputs.source_commits }}"
+        echo "源分支: ${{ github.event.inputs.source_branch }}"
         
         # 验证参数格式
         if [[ ! "${{ github.event.inputs.source_repo }}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
@@ -71,42 +72,58 @@ jobs:
         path: target-repo
         fetch-depth: 1
 
-    - name: 🔍 使用GitHub API分析提交和文件
-      id: api-analyze
+    - name: 🔍 智能查找提交和文件
+      id: smart-analyze
       run: |
-        echo "=== 使用GitHub API分析提交和文件 ==="
+        echo "=== 智能查找提交和文件 ==="
         
-        # 设置API基础信息
         REPO="${{ github.event.inputs.source_repo }}"
+        BRANCH="${{ github.event.inputs.source_branch }}"
         COMMITS=$(echo "${{ github.event.inputs.source_commits }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
         
-        echo "分析提交: $COMMITS"
+        echo "查找提交: $COMMITS"
+        echo "在分支: $BRANCH"
         
         # 存储结果
         all_files=()
         resolved_commits=()
         error_count=0
         
+        # 首先获取分支的最新提交
+        echo "获取分支 $BRANCH 的信息..."
+        branch_url="https://api.github.com/repos/$REPO/branches/$BRANCH"
+        branch_response=$(curl -s \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "$branch_url")
+        
+        if echo "$branch_response" | grep -q '"name"'; then
+          branch_sha=$(echo "$branch_response" | grep '"sha"' | head -1 | cut -d'"' -f4)
+          echo "✅ 分支 $BRANCH 最新提交: ${branch_sha:0:8}"
+        else
+          echo "❌ 无法获取分支 $BRANCH 信息"
+          echo "响应: $branch_response"
+          exit 1
+        fi
+        
+        # 搜索提交
         for commit in $COMMITS; do
-          echo "获取提交 $commit 的信息..."
+          echo "搜索提交: $commit"
           
-          # 使用GitHub API获取提交详情
+          # 方法1: 直接通过API获取提交
           api_url="https://api.github.com/repos/$REPO/commits/$commit"
-          echo "API URL: $api_url"
-          
-          # 使用GitHub Token进行认证
           response=$(curl -s \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "$api_url")
           
-          # 检查API响应
           if echo "$response" | grep -q '"sha"'; then
+            # 提交存在
             sha=$(echo "$response" | grep '"sha"' | head -1 | cut -d'"' -f4)
+            echo "✅ 找到提交: $commit -> ${sha:0:8}"
             resolved_commits+=("$sha")
-            echo "✅ 提交 $commit -> ${sha:0:8}"
             
-            # 提取文件变更
+            # 提取文件
             files=$(echo "$response" | grep '"filename"' | cut -d'"' -f4)
             if [ -n "$files" ]; then
               while IFS= read -r file; do
@@ -116,30 +133,73 @@ jobs:
                 fi
               done <<< "$files"
             fi
+          else
+            # 方法2: 搜索提交
+            echo "尝试搜索提交 $commit..."
+            search_url="https://api.github.com/search/commits?q=repo:$REPO+$commit"
+            search_response=$(curl -s \
+              -H "Accept: application/vnd.github.cloak-preview+json" \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "$search_url")
             
-            # 检查是否有更多文件（分页）
-            files_url=$(echo "$response" | grep '"files_url"' | cut -d'"' -f4)
-            if [ -n "$files_url" ]; then
-              echo "获取详细文件列表: $files_url"
-              files_response=$(curl -s \
+            if echo "$search_response" | grep -q '"total_count"' && echo "$search_response" | grep -q '"sha"'; then
+              search_sha=$(echo "$search_response" | grep '"sha"' | head -1 | cut -d'"' -f4)
+              echo "✅ 搜索到提交: $commit -> ${search_sha:0:8}"
+              resolved_commits+=("$search_sha")
+              
+              # 获取提交详情
+              commit_url="https://api.github.com/repos/$REPO/commits/$search_sha"
+              commit_response=$(curl -s \
                 -H "Accept: application/vnd.github.v3+json" \
                 -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "$files_url")
+                "$commit_url")
               
-              more_files=$(echo "$files_response" | grep '"filename"' | cut -d'"' -f4)
-              if [ -n "$more_files" ]; then
+              files=$(echo "$commit_response" | grep '"filename"' | cut -d'"' -f4)
+              if [ -n "$files" ]; then
                 while IFS= read -r file; do
                   if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
                     all_files+=("$file")
                     echo "📄 $file"
                   fi
-                done <<< "$more_files"
+                done <<< "$files"
+              fi
+            else
+              # 方法3: 获取分支提交历史，查找匹配的提交
+              echo "在分支历史中查找提交 $commit..."
+              commits_url="https://api.github.com/repos/$REPO/commits?sha=$BRANCH&per_page=100"
+              commits_response=$(curl -s \
+                -H "Accept: application/vnd.github.v3+json" \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                "$commits_url")
+              
+              # 在提交历史中查找匹配的短哈希
+              found_commit=$(echo "$commits_response" | grep -o "\"sha\":\"[^\"]*$commit[^\"]*\"" | head -1 | cut -d'"' -f4)
+              
+              if [ -n "$found_commit" ]; then
+                echo "✅ 在历史中找到提交: $commit -> ${found_commit:0:8}"
+                resolved_commits+=("$found_commit")
+                
+                # 获取提交详情
+                commit_url="https://api.github.com/repos/$REPO/commits/$found_commit"
+                commit_response=$(curl -s \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                  "$commit_url")
+                
+                files=$(echo "$commit_response" | grep '"filename"' | cut -d'"' -f4)
+                if [ -n "$files" ]; then
+                  while IFS= read -r file; do
+                    if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
+                      all_files+=("$file")
+                      echo "📄 $file"
+                    fi
+                  done <<< "$files"
+                fi
+              else
+                echo "❌ 无法找到提交: $commit"
+                error_count=$((error_count + 1))
               fi
             fi
-          else
-            echo "❌ 无法获取提交 $commit 的信息"
-            echo "API响应: $response"
-            error_count=$((error_count + 1))
           fi
         done
         
@@ -162,7 +222,7 @@ jobs:
         
         echo "commits_count=${#resolved_commits[@]}" >> $GITHUB_OUTPUT
         echo "files_count=${#all_files[@]}" >> $GITHUB_OUTPUT
-        echo "✅ API分析完成"
+        echo "✅ 分析完成"
 
     - name: 📥 按需下载源文件
       id: download-files
@@ -188,7 +248,7 @@ jobs:
         
         echo "开始下载文件..."
         
-        # 下载每个文件（使用GitHub raw内容）
+        # 下载每个文件
         while IFS= read -r file; do
           [ -z "$file" ] && continue
           
@@ -196,7 +256,6 @@ jobs:
           raw_url="https://raw.githubusercontent.com/$REPO/$BRANCH/$file"
           
           echo "⬇️ 下载: $file"
-          echo "URL: $raw_url"
           
           # 创建目录结构
           mkdir -p "source-files/$(dirname "$file")"
@@ -208,24 +267,6 @@ jobs:
           else
             echo "❌ 下载失败: $file"
             errors=$((errors + 1))
-            
-            # 尝试使用API下载
-            echo "尝试通过API下载..."
-            api_url="https://api.github.com/repos/$REPO/contents/$file?ref=$BRANCH"
-            api_response=$(curl -s \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-              "$api_url")
-            
-            if echo "$api_response" | grep -q '"content"'; then
-              content=$(echo "$api_response" | grep '"content"' | cut -d'"' -f4)
-              # Base64解码内容
-              if echo "$content" | base64 -d > "source-files/$file" 2>/dev/null; then
-                downloaded=$((downloaded + 1))
-                errors=$((errors - 1))
-                echo "✅ API下载成功"
-              fi
-            fi
           fi
           
           # 短暂延迟，避免被限流
@@ -341,19 +382,19 @@ jobs:
         # 智能文件提取完成
         
         ## 执行统计
-        - **处理提交**: ${{ steps.api-analyze.outputs.commits_count || '0' }}
-        - **发现文件**: ${{ steps.api-analyze.outputs.files_count || '0' }}
+        - **处理提交**: ${{ steps.smart-analyze.outputs.commits_count || '0' }}
+        - **发现文件**: ${{ steps.smart-analyze.outputs.files_count || '0' }}
         - **下载文件**: ${{ steps.download-files.outputs.actual_downloaded || '0' }} (${{ steps.download-files.outputs.download_errors || '0' }} 失败)
         - **同步文件**: ${{ steps.sync-files.outputs.actual_copied || '0' }} (${{ steps.sync-files.outputs.sync_errors || '0' }} 失败)
         - **提交状态**: ${{ steps.create-commit.outputs.has_changes == 'true' && '✅ 已提交' || '⚠️ 无变更' }}
         
-        ## 性能特点
-        - ✅ **不克隆整个仓库** - 大幅减少下载时间
-        - ✅ **API驱动分析** - 快速获取文件信息
-        - ✅ **按需下载** - 只下载需要的文件
-        - ✅ **支持历史提交** - 不受浅克隆限制
+        ## 技术说明
+        本方案使用智能搜索策略查找提交：
+        1. 直接API查询
+        2. 全局搜索
+        3. 分支历史搜索
         
-        **预计执行时间**: 1-3分钟（取决于文件数量）
+        **预计执行时间**: 1-3分钟
         EOF
 
     - name: 🧹 清理临时文件
