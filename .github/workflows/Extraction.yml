@@ -4,31 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       source_repo_url:
-        description: "Source repository URL"
+        description: "源仓库URL"
         required: true
         default: "https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod"
       target_repo_url:
-        description: "Target repository URL"
+        description: "目标仓库URL"
         required: true
         default: "https://github.com/mozi9/XCD"
       source_commits:
-        description: "Source commit hashes (comma separated, short or full hash)"
+        description: "源仓库提交哈希（逗号分隔，支持短哈希或完整哈希）"
         required: true
         default: "47b6de7"
       source_branch:
-        description: "Source branch"
+        description: "源分支"
         required: true
         default: "android_kernel_common_android12-5.10"
       target_branch:
-        description: "Target branch"
+        description: "目标分支"
         required: true
         default: "miuix"
       commit_title:
-        description: "Commit title"
+        description: "提交标题"
         required: true
         default: "fs: Bump SuSFS version to v2.0.0"
       commit_description:
-        description: "Commit description (optional)"
+        description: "提交描述（可选）"
         required: false
         default: ""
 
@@ -152,7 +152,7 @@ jobs:
             exit 1
           else
             # 没有匹配
-            echo "❌ Error: Cannot resolve commit '$commit'"
+            echo "❌ Error: Cannot resolve commit '$commit"
             exit 1
           fi
         done
