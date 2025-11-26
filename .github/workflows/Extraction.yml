@@ -1,58 +1,36 @@
-name: Advanced File Extraction and Commit
+name: File Extraction and Commit
 
 on:
   workflow_dispatch:
     inputs:
       source_repo_url:
-        description: "Source repository URL (GitHub URL)"
+        description: "Source repository URL"
         required: true
         default: "https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod"
       target_repo_url:
-        description: "Target repository URL (GitHub URL)"
+        description: "Target repository URL"
         required: true
         default: "https://github.com/mozi9/XCD"
       source_commits:
-        description: "Source commit hashes (short or full, comma separated)"
+        description: "Source commit hashes (comma separated)"
         required: true
         default: "41273ce"
       source_branch:
-        description: "Source branch to get commits from"
+        description: "Source branch"
         required: true
         default: "android_kernel_common_android12-5.10"
       target_branch:
-        description: "Target branch to push to"
+        description: "Target branch"
         required: true
         default: "miuix"
       commit_title:
-        description: "Commit title/message"
+        description: "Commit title"
         required: true
         default: "fs: Bump SuSFS version to v2.0.0"
       commit_description:
         description: "Commit description (optional)"
         required: false
-        default: "Co-authored-by: simonpunk <simonpunk2016@gmail.com>\nCo-authored-by: JackA1ltman <cs2dtzq@163.com>"
-      file_operations:
-        description: "File operations mode"
-        required: false
-        default: "all"
-        type: choice
-        options:
-        - all
-        - modified_only
-        - specific_files
-      specific_files:
-        description: "Specific file patterns (comma separated, for specific_files mode)"
-        required: false
-        default: "fs/susfs/**,include/linux/susfs.h"
-      backup_mode:
-        description: "Backup mode before operations"
-        required: false
-        default: "create_backup"
-        type: choice
-        options:
-        - create_backup
-        - skip_backup
-        - validate_only
+        default: ""
 
 jobs:
   extract-and-commit:
@@ -90,7 +68,7 @@ jobs:
         echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
         echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
         echo "✅ Source repo: $SOURCE_REPO"
-        echo "✅ Target repo: $ARGET_REPO"
+        echo "✅ Target repo: $TARGET_REPO"
 
     - name: Checkout source repository
       uses: actions/checkout@v4
@@ -116,22 +94,7 @@ jobs:
         git config --global user.email "mozi9@users.noreply.github.com"
         echo "Git configured: mozi9 <mozi9@users.noreply.github.com>"
 
-    - name: Create backup if enabled
-      if: inputs.backup_mode == 'create_backup'
-      run: |
-        cd target-repo
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        BACKUP_DIR="../backup_$TIMESTAMP"
-        mkdir -p "$BACKUP_DIR"
-        
-        # 备份所有文件
-        echo "📂 Creating backup to $BACKUP_DIR"
-        find . -type f -not -path '*/\.git/*' -exec cp --parents {} "$BACKUP_DIR" \; 2>/dev/null || true
-        
-        echo "backup_dir=$BACKUP_DIR" >> $GITHUB_OUTPUT
-        echo "✅ Backup created: $BACKUP_DIR"
-
-    - name: Resolve commit hashes and analyze changes
+    - name: Analyze commit changes
       id: analyze-changes
       run: |
         cd source-repo
@@ -157,186 +120,92 @@ jobs:
         # 分析文件变更
         ALL_MODIFIED_FILES=""
         ALL_DELETED_FILES=""
-        ALL_RENAMED_FILES=""
-        COMMIT_DETAILS=""
         
         echo "=== Analyzing file changes ==="
         
         for commit in $(cat ../resolved_commits.txt); do
           echo "📊 Processing commit: $commit"
-          COMMIT_INFO=$(git show --oneline -s $commit)
-          COMMIT_DETAILS="$COMMIT_DETAILS$COMMIT_INFO"$'\n'
           
-          # 获取所有变更类型
           MODIFIED_FILES=$(git show --name-status --format= $commit | awk '$1 == "A" || $1 == "M" {print $2}' | sort -u)
           DELETED_FILES=$(git show --name-status --format= $commit | awk '$1 == "D" {print $2}' | sort -u)
-          RENAMED_FILES=$(git show --name-status --format= $commit | awk '$1 == "R" {print $3}' | sort -u)
           
           if [ -n "$MODIFIED_FILES" ]; then
-            echo "  📄 Modified/Added: $(echo "$MODIFIED_FILES" | tr '\n' ' ')"
+            echo "  📄 Modified/Added: $(echo "$MODIFIED_FILES" | wc -l) files"
             ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$MODIFIED_FILES"
           fi
           if [ -n "$DELETED_FILES" ]; then
-            echo "  🗑️ Deleted: $(echo "$DELETED_FILES" | tr '\n' ' ')"
+            echo "  🗑️ Deleted: $(echo "$DELETED_FILES" | wc -l) files"
             ALL_DELETED_FILES="$ALL_DELETED_FILES"$'\n'"$DELETED_FILES"
-          fi
-          if [ -n "$RENAMED_FILES" ]; then
-            echo "  🔄 Renamed: $(echo "$RENAMED_FILES" | tr '\n' ' ')"
-            ALL_RENAMED_FILES="$ALL_RENAMED_FILES"$'\n'"$RENAMED_FILES"
           fi
         done
         
         # 去重文件列表
         UNIQUE_MODIFIED=$(echo "$ALL_MODIFIED_FILES" | grep -v '^$' | sort -u)
         UNIQUE_DELETED=$(echo "$ALL_DELETED_FILES" | grep -v '^$' | sort -u)
-        UNIQUE_RENAMED=$(echo "$ALL_RENAMED_FILES" | grep -v '^$' | sort -u)
-        
-        # 文件过滤逻辑
-        if [ "${{ inputs.file_operations }}" == "specific_files" ]; then
-          PATTERNS=$(echo "${{ inputs.specific_files }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          FILTERED_MODIFIED=""
-          FILTERED_DELETED=""
-          
-          echo "🔍 Filtering files by patterns: $PATTERNS"
-          
-          for pattern in $PATTERNS; do
-            # 使用find进行模式匹配
-            while IFS= read -r file; do
-              if [[ "$file" == $pattern ]] || [[ "$file" == */${pattern#*/} ]] || [[ "$pattern" == *"*"* && $(echo "$file" | grep -q "$(echo "$pattern" | sed 's/\*/.*/g')" && echo 1) ]]; then
-                FILTERED_MODIFIED="$FILTERED_MODIFIED"$'\n'"$file"
-                echo "  ✅ Included: $file"
-              fi
-            done <<< "$UNIQUE_MODIFIED"
-            
-            while IFS= read -r file; do
-              if [[ "$file" == $pattern ]] || [[ "$file" == */${pattern#*/} ]] || [[ "$pattern" == *"*"* && $(echo "$file" | grep -q "$(echo "$pattern" | sed 's/\*/.*/g')" && echo 1) ]]; then
-                FILTERED_DELETED="$FILTERED_DELETED"$'\n'"$file"
-                echo "  ✅ Included: $file"
-              fi
-            done <<< "$UNIQUE_DELETED"
-          done
-          
-          UNIQUE_MODIFIED=$(echo "$FILTERED_MODIFIED" | grep -v '^$' | sort -u)
-          UNIQUE_DELETED=$(echo "$FILTERED_DELETED" | grep -v '^$' | sort -u)
-        fi
         
         # 保存文件列表
         echo "$UNIQUE_MODIFIED" > ../modified_files.txt
         echo "$UNIQUE_DELETED" > ../deleted_files.txt
-        echo "$UNIQUE_RENAMED" > ../renamed_files.txt
-        echo "$COMMIT_DETAILS" > ../commit_details.txt
         
         MOD_COUNT=$(echo "$UNIQUE_MODIFIED" | grep -c . || echo 0)
         DEL_COUNT=$(echo "$UNIQUE_DELETED" | grep -c . || echo 0)
-        REN_COUNT=$(echo "$UNIQUE_RENAMED" | grep -c . || echo 0)
         
         echo "modified_files_count=$MOD_COUNT" >> $GITHUB_OUTPUT
         echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
-        echo "renamed_files_count=$REN_COUNT" >> $GITHUB_OUTPUT
         
         echo "✅ Analysis complete:"
         echo "   Modified/Added: $MOD_COUNT files"
         echo "   Deleted: $DEL_COUNT files"
-        echo "   Renamed: $REN_COUNT files"
 
-    - name: Validate file operations
-      if: inputs.backup_mode == 'validate_only'
+    - name: Delete files from target
+      id: delete-files
       run: |
-        echo "🔍 Validation mode - checking file operations"
-        echo "Modified files (${{ steps.analyze-changes.outputs.modified_files_count }}):"
-        cat modified_files.txt | head -10
-        echo "..."
+        cd target-repo
         
-        echo "Deleted files (${{ steps.analyze-changes.outputs.deleted_files_count }}):"
-        cat deleted_files.txt | head -10
-        echo "..."
+        echo "🗑️ Deleting files..."
+        DELETED_COUNT=0
         
-        echo "✅ Validation complete. No actual file operations performed."
-        echo "validation_result=passed" >> $GITHUB_OUTPUT
-      continue-on-error: true
-
-    - name: Perform file operations
-      if: inputs.backup_mode != 'validate_only'
-      run: |
-        echo "=== Performing File Operations ==="
-        
-        # 删除操作
-        if [ -s deleted_files.txt ]; then
-          echo "🗑️ Deleting files..."
-          DELETED_COUNT=0
+        if [ -s ../deleted_files.txt ]; then
           while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "target-repo/$file" ]; then
+            if [ -n "$file" ] && [ -f "$file" ]; then
               # 安全检查
               if [[ "$file" != / && "$file" != /* && "$file" != .git* && "$file" != "." && "$file" != ".." ]]; then
                 echo "  Deleting: $file"
-                rm -f "target-repo/$file"
+                rm -f "$file"
                 DELETED_COUNT=$((DELETED_COUNT + 1))
-                
-                # 删除空目录
-                dir=$(dirname "target-repo/$file")
-                if [ -d "$dir" ] && [ -z "$(ls -A "$dir")" ]; then
-                  rmdir "$dir" 2>/dev/null || true
-                fi
               else
                 echo "  🚫 Skipped (safety): $file"
               fi
             fi
-          done < deleted_files.txt
-          echo "✅ Deleted $DELETED_COUNT files"
-        else
-          echo "ℹ️ No files to delete"
-          DELETED_COUNT=0
+          done < ../deleted_files.txt
         fi
         
-        # 复制操作
-        if [ -s modified_files.txt ]; then
-          echo "📄 Copying files..."
-          COPIED_COUNT=0
+        echo "actual_deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+        echo "✅ Deleted $DELETED_COUNT files"
+
+    - name: Copy files to target
+      id: copy-files
+      run: |
+        cd source-repo
+        
+        echo "📄 Copying files..."
+        COPIED_COUNT=0
+        
+        if [ -s ../modified_files.txt ]; then
           while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "source-repo/$file" ]; then
+            if [ -n "$file" ] && [ -f "$file" ]; then
               echo "  Copying: $file"
-              mkdir -p "target-repo/$(dirname "$file")"
-              cp "source-repo/$file" "target-repo/$file"
+              mkdir -p "../target-repo/$(dirname "$file")"
+              cp "$file" "../target-repo/$file"
               COPIED_COUNT=$((COPIED_COUNT + 1))
             else
               echo "  ⚠️ Source file not found: $file"
             fi
-          done < modified_files.txt
-          echo "✅ Copied $COPIED_COUNT files"
-        else
-          echo "ℹ️ No files to copy"
-          COPIED_COUNT=0
+          done < ../modified_files.txt
         fi
         
-        echo "actual_deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
         echo "actual_copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
-
-    - name: Verify file operations
-      if: inputs.backup_mode != 'validate_only'
-      id: verify-files
-      run: |
-        echo "=== Verification ==="
-        cd target-repo
-        
-        echo "📊 File statistics:"
-        echo "Total files: $(find . -type f -not -path '*/\.git/*' | wc -l)"
-        echo "Total size: $(du -sh . | cut -f1)"
-        
-        echo "🔍 Git status:"
-        git status --short
-        
-        # 检查是否有实际变更
-        if git diff --quiet; then
-          echo "ℹ️ No changes detected"
-          echo "has_changes=false" >> $GITHUB_OUTPUT
-        else
-          echo "✅ Changes detected"
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-          
-          # 显示变更摘要
-          echo "📋 Change summary:"
-          git diff --stat
-        fi
+        echo "✅ Copied $COPIED_COUNT files"
 
     - name: Prepare commit message
       id: prepare-commit
@@ -345,17 +214,13 @@ jobs:
         COMMIT_TITLE="${{ inputs.commit_title }}"
         COMMIT_DESC="${{ inputs.commit_description }}"
         
-        # 构建详细的提交描述
-        DETAILED_DESC=""
-        if [ -s commit_details.txt ]; then
-          DETAILED_DESC="Source commits:\n$(cat commit_details.txt | head -10)"
-        fi
-        
+        # 如果没有提供描述，生成默认描述
         if [ -z "$COMMIT_DESC" ] || [ "$COMMIT_DESC" == "null" ]; then
-          COMMIT_DESC="Extracted files from ${{ inputs.source_repo_url }}"
+          COMMIT_DESC="Extracted files from ${{ inputs.source_repo_url }}\nCommits: ${{ inputs.source_commits }}"
         fi
         
-        FULL_DESC="$COMMIT_DESC\n\n$DETAILED_DESC\n\nFile operations:\n- Modified/Added: ${{ steps.analyze-changes.outputs.modified_files_count }} files\n- Deleted: ${{ steps.analyze-changes.outputs.deleted_files_count }} files\n- Renamed: ${{ steps.analyze-changes.outputs.renamed_files_count }} files\n\nSource: ${{ inputs.source_repo_url }}\nCommits: ${{ inputs.source_commits }}\nBranch: ${{ inputs.source_branch }}\nMode: ${{ inputs.file_operations }}"
+        # 添加文件统计信息
+        FULL_DESC="$COMMIT_DESC\n\nFile operations:\n- Copied: ${{ steps.analyze-changes.outputs.modified_files_count }} files\n- Deleted: ${{ steps.analyze-changes.outputs.deleted_files_count }} files\n\nSource: ${{ inputs.source_repo_url }}\nBranch: ${{ inputs.source_branch }}"
         
         echo "commit_title=$COMMIT_TITLE" >> $GITHUB_OUTPUT
         echo "commit_description=$FULL_DESC" >> $GITHUB_OUTPUT
@@ -366,66 +231,58 @@ jobs:
         echo -e "$FULL_DESC"
 
     - name: Commit and push changes
-      if: inputs.backup_mode != 'validate_only' && steps.verify-files.outputs.has_changes == 'true'
+      id: commit-push
       run: |
         cd target-repo
         
-        echo "💾 Committing changes..."
+        # 检查是否有变更
         git add -A
-        
-        # 使用多行提交信息
-        git commit -m "${{ steps.prepare-commit.outputs.commit_title }}" -m "${{ steps.prepare-commit.outputs.commit_description }}"
-        
-        echo "🚀 Pushing to repository..."
-        git push origin ${{ inputs.target_branch }}
-        
-        echo "✅ Successfully committed and pushed changes"
+        if git diff --cached --quiet; then
+          echo "❌ No changes to commit"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+          exit 1
+        else
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "💾 Committing changes..."
+          
+          # 显示变更文件
+          echo "📋 Changed files:"
+          git diff --cached --name-only | head -20
+          
+          # 提交更改
+          git commit -m "${{ steps.prepare-commit.outputs.commit_title }}" -m "${{ steps.prepare-commit.outputs.commit_description }}"
+          
+          echo "🚀 Pushing to repository..."
+          git push origin ${{ inputs.target_branch }}
+          
+          echo "✅ Successfully committed and pushed changes"
+        fi
 
     - name: Show final result
       run: |
         cat > $GITHUB_STEP_SUMMARY << EOF
-        # 文件处理结果 - ${{ inputs.backup_mode }}
+        # 文件处理完成
         
         ## 仓库信息
         - **源仓库**: ${{ inputs.source_repo_url }}
         - **目标仓库**: ${{ inputs.target_repo_url }}
         - **源分支**: ${{ inputs.source_branch }}
         - **目标分支**: ${{ inputs.target_branch }}
-        - **操作模式**: ${{ inputs.file_operations }}
-        - **备份模式**: ${{ inputs.backup_mode }}
-        
-        ## 分析结果
         - **处理的提交**: ${{ inputs.source_commits }}
+        
+        ## 文件操作统计
         - **分析出的修改文件**: ${{ steps.analyze-changes.outputs.modified_files_count }} 个
         - **分析出的删除文件**: ${{ steps.analyze-changes.outputs.deleted_files_count }} 个
-        - **分析出的重命名文件**: ${{ steps.analyze-changes.outputs.renamed_files_count }} 个
-        
-        EOF
-        
-        if [ "${{ inputs.backup_mode }}" = "validate_only" ]; then
-          echo "## 🔍 验证模式" >> $GITHUB_STEP_SUMMARY
-          echo "仅进行验证，未执行实际文件操作" >> $GITHUB_STEP_SUMMARY
-          echo "**验证结果**: ✅ 通过" >> $GITHUB_STEP_SUMMARY
-        elif [ "${{ inputs.backup_mode }}" = "create_backup" ]; then
-          echo "## 💾 备份信息" >> $GITHUB_STEP_SUMMARY
-          echo "备份目录: ${{ steps.create-backup.outputs.backup_dir }}" >> $GITHUB_STEP_SUMMARY
-        fi
-        
-        if [ "${{ inputs.backup_mode }}" != "validate_only" ]; then
-          cat >> $GITHUB_STEP_SUMMARY << EOF
-        
-        ## 实际操作结果
-        - **实际复制的文件**: ${{ steps.perform-operations.outputs.actual_copied_count }} 个
-        - **实际删除的文件**: ${{ steps.perform-operations.outputs.actual_deleted_count }} 个
+        - **实际复制的文件**: ${{ steps.copy-files.outputs.actual_copied_count }} 个
+        - **实际删除的文件**: ${{ steps.delete-files.outputs.actual_deleted_count }} 个
         
         ## 提交信息
         - **标题**: ${{ steps.prepare-commit.outputs.commit_title }}
         
         EOF
         
-          if [ "${{ steps.verify-files.outputs.has_changes }}" = "true" ]; then
-            echo "✅ **成功**: 从 ${{ steps.parse-urls.outputs.source_repo }} 提取并提交了 ${{ steps.perform-operations.outputs.actual_copied_count }} 个文件" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "ℹ️ **无变更**: 未检测到文件变更" >> $GITHUB_STEP_SUMMARY
-          fi
+        if [ "${{ steps.commit-push.outputs.has_changes }}" = "true" ]; then
+          echo "✅ **操作成功**: 已提交并推送更改到 ${{ inputs.target_branch }}" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ **无变更**: 未检测到文件变更，无需提交" >> $GITHUB_STEP_SUMMARY
         fi
