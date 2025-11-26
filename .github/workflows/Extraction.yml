@@ -349,7 +349,8 @@ jobs:
           git commit -m "${{ steps.prepare-commit.outputs.commit_title }}" -m "${{ steps.prepare-commit.outputs.commit_description }}"
           
           echo "🚀 Pushing to repository..."
-          git push -u origin ${{ inputs.target_branch }}
+          # 使用强制推送覆盖远程分支
+          git push -f origin ${{ inputs.target_branch }}
           
           echo "✅ Successfully committed and pushed changes"
         fi
