@@ -12,9 +12,9 @@ on:
         required: true
         default: "https://github.com/mozi9/XCD"
       source_commits:
-        description: "Source commit hashes (comma separated)"
+        description: "Source commit hashes (comma separated, short or full hash)"
         required: true
-        default: "41273ce"
+        default: "47b6de7"
       source_branch:
         description: "Source branch"
         required: true
@@ -79,14 +79,32 @@ jobs:
         path: source-repo
         fetch-depth: 0
 
-    - name: Checkout target repository
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ steps.parse-urls.outputs.target_repo }}
-        ref: ${{ inputs.target_branch }}
-        token: ${{ secrets.Mozi9_PAT }}
-        path: target-repo
-        fetch-depth: 0
+    - name: Checkout target repository (create branch if needed)
+      id: checkout-target
+      run: |
+        # 先克隆目标仓库
+        git clone https://${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-urls.outputs.target_repo }}.git target-repo
+        cd target-repo
+        
+        # 检查目标分支是否存在
+        if git show-ref --verify --quiet refs/heads/${{ inputs.target_branch }}; then
+          echo "✅ Target branch ${{ inputs.target_branch }} exists"
+          git checkout ${{ inputs.target_branch }}
+        else
+          echo "⚠️ Target branch ${{ inputs.target_branch }} does not exist, creating new branch"
+          # 创建新分支（基于当前默认分支或从头创建）
+          if git show-ref --verify --quiet refs/heads/main; then
+            git checkout -b ${{ inputs.target_branch }} main
+          elif git show-ref --verify --quiet refs/heads/master; then
+            git checkout -b ${{ inputs.target_branch }} master
+          else
+            # 如果没有默认分支，创建空分支
+            git checkout --orphan ${{ inputs.target_branch }}
+            git rm -rf .
+          fi
+        fi
+        
+        echo "✅ Checked out to target branch: ${{ inputs.target_branch }}"
 
     - name: Setup Git identity
       run: |
@@ -94,28 +112,66 @@ jobs:
         git config --global user.email "mozi9@users.noreply.github.com"
         echo "Git configured: mozi9 <mozi9@users.noreply.github.com>"
 
-    - name: Analyze commit changes
-      id: analyze-changes
+    - name: Resolve short hashes to full hashes
+      id: resolve-hashes
       run: |
         cd source-repo
         
-        # 解析提交哈希
+        # 解析提交哈希 - 处理短哈希和完整哈希
         COMMITS=$(echo "${{ inputs.source_commits }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
         RESOLVED_COMMITS=""
+        COMMIT_DETAILS=""
         
         echo "🔍 Resolving commits: $COMMITS"
+        
         for commit in $COMMITS; do
-          FULL_HASH=$(git rev-parse "$commit" 2>/dev/null || echo "")
-          if [ -n "$FULL_HASH" ]; then
+          echo "Processing: $commit"
+          
+          # 获取所有匹配的提交对象
+          MATCHING_COMMITS=$(git rev-list --all | grep "^$commit" || echo "")
+          MATCH_COUNT=$(echo "$MATCHING_COMMITS" | grep -c . || echo 0)
+          
+          if [ $MATCH_COUNT -eq 1 ]; then
+            # 唯一匹配，使用这个完整哈希
+            FULL_HASH=$(echo "$MATCHING_COMMITS")
+            COMMIT_INFO=$(git show --oneline -s "$FULL_HASH" 2>/dev/null || echo "Unknown commit")
+            
             RESOLVED_COMMITS="$RESOLVED_COMMITS$FULL_HASH"$'\n'
+            COMMIT_DETAILS="$COMMIT_DETAILS$COMMIT_INFO"$'\n'
+            
             echo "✅ Resolved $commit -> $FULL_HASH"
+            echo "   $COMMIT_INFO"
+            
+          elif [ $MATCH_COUNT -gt 1 ]; then
+            # 多个匹配，显示错误
+            echo "❌ Error: Short commit ID '$commit' is ambiguous. Matching commits:"
+            echo "$MATCHING_COMMITS" | while read hash; do
+              git show --oneline -s "$hash" 2>/dev/null || echo "  $hash - Unknown"
+            done
+            echo "Please use a longer prefix to disambiguate."
+            exit 1
           else
-            echo "❌ Error: Cannot resolve commit $commit"
+            # 没有匹配
+            echo "❌ Error: Cannot resolve commit '$commit'"
             exit 1
           fi
         done
         
+        if [ -z "$RESOLVED_COMMITS" ]; then
+          echo "❌ No valid commits found"
+          exit 1
+        fi
+        
         echo "$RESOLVED_COMMITS" | grep -v '^$' > ../resolved_commits.txt
+        echo "$COMMIT_DETAILS" | grep -v '^$' > ../commit_details.txt
+        
+        echo "✅ Successfully resolved all commits:"
+        cat ../commit_details.txt
+
+    - name: Analyze commit changes
+      id: analyze-changes
+      run: |
+        cd source-repo
         
         # 分析文件变更
         ALL_MODIFIED_FILES=""
@@ -124,17 +180,21 @@ jobs:
         echo "=== Analyzing file changes ==="
         
         for commit in $(cat ../resolved_commits.txt); do
-          echo "📊 Processing commit: $commit"
+          COMMIT_INFO=$(git show --oneline -s "$commit")
+          echo "📊 Processing commit: $COMMIT_INFO"
           
-          MODIFIED_FILES=$(git show --name-status --format= $commit | awk '$1 == "A" || $1 == "M" {print $2}' | sort -u)
-          DELETED_FILES=$(git show --name-status --format= $commit | awk '$1 == "D" {print $2}' | sort -u)
+          # 使用完整哈希分析文件变更
+          MODIFIED_FILES=$(git show --name-status --format= "$commit" -- | awk '$1 == "A" || $1 == "M" {print $2}' | sort -u)
+          DELETED_FILES=$(git show --name-status --format= "$commit" -- | awk '$1 == "D" {print $2}' | sort -u)
           
           if [ -n "$MODIFIED_FILES" ]; then
-            echo "  📄 Modified/Added: $(echo "$MODIFIED_FILES" | wc -l) files"
+            FILE_COUNT=$(echo "$MODIFIED_FILES" | wc -l)
+            echo "  📄 Modified/Added: $FILE_COUNT files"
             ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$MODIFIED_FILES"
           fi
           if [ -n "$DELETED_FILES" ]; then
-            echo "  🗑️ Deleted: $(echo "$DELETED_FILES" | wc -l) files"
+            FILE_COUNT=$(echo "$DELETED_FILES" | wc -l)
+            echo "  🗑️ Deleted: $FILE_COUNT files"
             ALL_DELETED_FILES="$ALL_DELETED_FILES"$'\n'"$DELETED_FILES"
           fi
         done
@@ -156,6 +216,20 @@ jobs:
         echo "✅ Analysis complete:"
         echo "   Modified/Added: $MOD_COUNT files"
         echo "   Deleted: $DEL_COUNT files"
+        
+        # 显示找到的文件（前10个）
+        if [ $MOD_COUNT -gt 0 ]; then
+          echo "Modified files (first 10):"
+          head -10 ../modified_files.txt | while read file; do echo "  - $file"; done
+        else
+          echo "⚠️ No modified files found"
+        fi
+        if [ $DEL_COUNT -gt 0 ]; then
+          echo "Deleted files (first 10):"
+          head -10 ../deleted_files.txt | while read file; do echo "  - $file"; done
+        else
+          echo "ℹ️ No deleted files found"
+        fi
 
     - name: Delete files from target
       id: delete-files
@@ -173,6 +247,12 @@ jobs:
                 echo "  Deleting: $file"
                 rm -f "$file"
                 DELETED_COUNT=$((DELETED_COUNT + 1))
+                
+                # 尝试删除空目录
+                dir=$(dirname "$file")
+                if [ -d "$dir" ] && [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+                  rmdir "$dir" 2>/dev/null || true
+                fi
               else
                 echo "  🚫 Skipped (safety): $file"
               fi
@@ -214,13 +294,19 @@ jobs:
         COMMIT_TITLE="${{ inputs.commit_title }}"
         COMMIT_DESC="${{ inputs.commit_description }}"
         
-        # 如果没有提供描述，生成默认描述
-        if [ -z "$COMMIT_DESC" ] || [ "$COMMIT_DESC" == "null" ]; then
-          COMMIT_DESC="Extracted files from ${{ inputs.source_repo_url }}\nCommits: ${{ inputs.source_commits }}"
+        # 获取提交详情
+        COMMIT_DETAILS=""
+        if [ -s commit_details.txt ]; then
+          COMMIT_DETAILS=$(cat commit_details.txt | head -5)
         fi
         
-        # 添加文件统计信息
-        FULL_DESC="$COMMIT_DESC\n\nFile operations:\n- Copied: ${{ steps.analyze-changes.outputs.modified_files_count }} files\n- Deleted: ${{ steps.analyze-changes.outputs.deleted_files_count }} files\n\nSource: ${{ inputs.source_repo_url }}\nBranch: ${{ inputs.source_branch }}"
+        # 如果没有提供描述，生成默认描述
+        if [ -z "$COMMIT_DESC" ] || [ "$COMMIT_DESC" == "null" ]; then
+          COMMIT_DESC="Extracted files from ${{ inputs.source_repo_url }}"
+        fi
+        
+        # 添加文件统计信息和提交详情
+        FULL_DESC="$COMMIT_DESC\n\nSource commits:\n$COMMIT_DETAILS\n\nFile operations:\n- Copied: ${{ steps.analyze-changes.outputs.modified_files_count }} files\n- Deleted: ${{ steps.analyze-changes.outputs.deleted_files_count }} files\n\nSource: ${{ inputs.source_repo_url }}\nBranch: ${{ inputs.source_branch }}"
         
         echo "commit_title=$COMMIT_TITLE" >> $GITHUB_OUTPUT
         echo "commit_description=$FULL_DESC" >> $GITHUB_OUTPUT
@@ -247,13 +333,13 @@ jobs:
           
           # 显示变更文件
           echo "📋 Changed files:"
-          git diff --cached --name-only | head -20
+          git diff --cached --name-only | while read file; do echo "  - $file"; done
           
           # 提交更改
           git commit -m "${{ steps.prepare-commit.outputs.commit_title }}" -m "${{ steps.prepare-commit.outputs.commit_description }}"
           
           echo "🚀 Pushing to repository..."
-          git push origin ${{ inputs.target_branch }}
+          git push -u origin ${{ inputs.target_branch }}
           
           echo "✅ Successfully committed and pushed changes"
         fi
