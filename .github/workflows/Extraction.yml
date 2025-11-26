@@ -3,14 +3,14 @@ name: File Extraction and Commit
 on:
   workflow_dispatch:
     inputs:
-      source_repo_url:
-        description: "源仓库URL"
+      source_repo:
+        description: "源仓库（格式：owner/repo）"
         required: true
-        default: "https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod"
-      target_repo_url:
-        description: "目标仓库URL"
+        default: "ApartTUSITU/kernel_xiaomi_sm8250_mod"
+      target_repo:
+        description: "目标仓库（格式：owner/repo）"
         required: true
-        default: "https://github.com/mozi9/XCD"
+        default: "mozi9/XCD"
       source_commits:
         description: "源仓库提交哈希（逗号分隔，支持短哈希或完整哈希）"
         required: true
@@ -18,7 +18,7 @@ on:
       source_branch:
         description: "源分支"
         required: true
-        default: "android_kernel_common_android12-5.10"
+        default: "android16-aptusitu-new"
       target_branch:
         description: "目标分支"
         required: true
@@ -44,14 +44,20 @@ jobs:
       id: validate-inputs
       run: |
         echo "=== 验证输入参数 ==="
+        echo "源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "源分支: ${{ github.event.inputs.source_branch }}"
+        echo "目标分支: ${{ github.event.inputs.target_branch }}"
+        echo "提交哈希: ${{ github.event.inputs.source_commits }}"
         
-        if [[ ! "${{ github.event.inputs.source_repo_url }}" =~ ^https://github.com/ ]]; then
-          echo "❌ 错误：源仓库URL格式不正确"
+        # 验证仓库格式
+        if [[ ! "${{ github.event.inputs.source_repo }}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+          echo "❌ 错误：源仓库格式不正确，应为 owner/repo 格式"
           exit 1
         fi
         
-        if [[ ! "${{ github.event.inputs.target_repo_url }}" =~ ^https://github.com/ ]]; then
-          echo "❌ 错误：目标仓库URL格式不正确"
+        if [[ ! "${{ github.event.inputs.target_repo }}" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]]; then
+          echo "❌ 错误：目标仓库格式不正确，应为 owner/repo 格式"
           exit 1
         fi
         
@@ -60,12 +66,22 @@ jobs:
           exit 1
         fi
         
+        if [[ -z "${{ github.event.inputs.source_branch }}" ]]; then
+          echo "❌ 错误：源分支不能为空"
+          exit 1
+        fi
+        
+        if [[ -z "${{ github.event.inputs.target_branch }}" ]]; then
+          echo "❌ 错误：目标分支不能为空"
+          exit 1
+        fi
+        
         echo "✅ 输入参数验证通过"
 
     - name: 📥 检出源仓库（使用Mozi9_PAT）
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.event.inputs.source_repo_url }}
+        repository: ${{ github.event.inputs.source_repo }}
         ref: ${{ github.event.inputs.source_branch }}
         token: ${{ secrets.Mozi9_PAT }}
         path: source-repo
@@ -74,7 +90,7 @@ jobs:
     - name: 📥 检出目标仓库（使用Mozi9_PAT）
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.event.inputs.target_repo_url }}
+        repository: ${{ github.event.inputs.target_repo }}
         ref: ${{ github.event.inputs.target_branch }}
         token: ${{ secrets.Mozi9_PAT }}
         path: target-repo
@@ -102,24 +118,36 @@ jobs:
           exit 1
         fi
         
-        echo "正在解析提交哈希..."
+        echo "正在解析 $(( $(echo "$COMMITS" | wc -l) )) 个提交哈希..."
         resolved_commits=()
+        error_count=0
         
         for commit in $COMMITS; do
           echo "尝试解析: $commit"
           if full_hash=$(git rev-parse --verify "$commit" 2>/dev/null); then
-            if git merge-base --is-ancestor "$full_hash" HEAD 2>/dev/null; then
+            # 检查提交是否存在于当前分支
+            if git show --quiet "$full_hash" >/dev/null 2>&1; then
               resolved_commits+=("$full_hash")
               echo "✅ 解析成功: $commit -> $full_hash"
             else
-              echo "❌ 错误: 提交 $commit 不在分支 ${{ github.event.inputs.source_branch }} 的历史中"
-              exit 1
+              echo "❌ 错误: 提交 $commit 不存在于仓库中"
+              error_count=$((error_count + 1))
             fi
           else
             echo "❌ 错误: 无法解析提交 '$commit'"
-            exit 1
+            error_count=$((error_count + 1))
           fi
         done
+        
+        if [ $error_count -gt 0 ]; then
+          echo "❌ 共发现 $error_count 个错误，无法继续"
+          exit 1
+        fi
+        
+        if [ ${#resolved_commits[@]} -eq 0 ]; then
+          echo "❌ 错误：没有成功解析任何提交"
+          exit 1
+        fi
         
         printf "%s\n" "${resolved_commits[@]}" > ../resolved_commits.txt
         echo "commits_count=${#resolved_commits[@]}" >> $GITHUB_OUTPUT
@@ -147,19 +175,41 @@ jobs:
         while IFS= read -r commit; do
           [ -z "$commit" ] && continue
           
-          echo "分析提交: $commit"
+          echo "分析提交: ${commit:0:8}"
           
-          git show --name-status --format= "$commit" | while IFS=$'\t' read -r status file; do
+          # 使用更安全的方式获取文件变更
+          git show --name-status --format= "$commit" 2>/dev/null | while IFS=$'\t' read -r status file; do
             [ -z "$file" ] && continue
             
+            # 安全检查：确保文件路径安全
+            if [[ "$file" == / || "$file" == /* || "$file" == .git* ]]; then
+              echo "⚠️ 跳过不安全文件路径: $file"
+              continue
+            fi
+            
             case "$status" in
-              A|M|C|R)
-                if [[ ! " ${modified_files[@]} " =~ " ${file} " ]]; then
+              A|M|C|R*)
+                # 检查文件是否已存在列表中
+                found=0
+                for existing_file in "${modified_files[@]}"; do
+                  if [ "$existing_file" = "$file" ]; then
+                    found=1
+                    break
+                  fi
+                done
+                if [ $found -eq 0 ]; then
                   modified_files+=("$file")
                 fi
                 ;;
               D)
-                if [[ ! " ${deleted_files[@]} " =~ " ${file} " ]]; then
+                found=0
+                for existing_file in "${deleted_files[@]}"; do
+                  if [ "$existing_file" = "$file" ]; then
+                    found=1
+                    break
+                  fi
+                done
+                if [ $found -eq 0 ]; then
                   deleted_files+=("$file")
                 fi
                 ;;
@@ -167,21 +217,26 @@ jobs:
           done
         done < ../resolved_commits.txt
         
+        # 保存文件列表
         if [ ${#modified_files[@]} -gt 0 ]; then
           printf "%s\n" "${modified_files[@]}" | sort -u > ../modified_files.txt
+          echo "📄 发现 ${#modified_files[@]} 个修改/新增文件"
         else
           touch ../modified_files.txt
+          echo "ℹ️ 没有发现修改/新增文件"
         fi
         
         if [ ${#deleted_files[@]} -gt 0 ]; then
           printf "%s\n" "${deleted_files[@]}" | sort -u > ../deleted_files.txt
+          echo "🗑️ 发现 ${#deleted_files[@]} 个删除文件"
         else
           touch ../deleted_files.txt
+          echo "ℹ️ 没有发现删除文件"
         fi
         
         echo "modified_files_count=${#modified_files[@]}" >> $GITHUB_OUTPUT
         echo "deleted_files_count=${#deleted_files[@]}" >> $GITHUB_OUTPUT
-        echo "✅ 分析完成: 修改文件 ${#modified_files[@]} 个, 删除文件 ${#deleted_files[@]} 个"
+        echo "✅ 文件变更分析完成"
 
     - name: 💾 创建备份
       id: create-backup
@@ -189,8 +244,13 @@ jobs:
         cd target-repo
         echo "=== 创建目标仓库备份 ==="
         timestamp=$(date +%Y%m%d_%H%M%S)
-        cp -r . "../target-backup-$timestamp"
-        echo "✅ 备份创建完成: target-backup-$timestamp"
+        backup_dir="../target-backup-$timestamp"
+        
+        # 创建备份，排除.git目录
+        mkdir -p "$backup_dir"
+        find . -maxdepth 1 -not -name '.' -not -name '.git' -exec cp -r {} "$backup_dir/" \;
+        
+        echo "✅ 备份创建完成: $(basename "$backup_dir")"
 
     - name: 🗑️ 安全删除文件
       id: delete-files
@@ -203,24 +263,40 @@ jobs:
         
         echo "=== 安全删除文件 ==="
         deleted_count=0
-        safe_deleted_files=()
+        error_count=0
         
         if [ -s ../deleted_files.txt ]; then
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             
+            # 严格的安全检查
             if [[ "$file" == / || "$file" == /* || "$file" == .git* || "$file" == "." || "$file" == ".." || "$file" == */.git* ]]; then
               echo "❌ 安全错误: 拒绝删除受限文件 '$file'"
-              exit 1
+              error_count=$((error_count + 1))
+              continue
             fi
             
             if [ -f "$file" ]; then
               echo "🗑️ 删除: $file"
-              rm -f -- "$file"
-              deleted_count=$((deleted_count + 1))
-              safe_deleted_files+=("$file")
+              if rm -f -- "$file"; then
+                deleted_count=$((deleted_count + 1))
+                
+                # 尝试删除空目录
+                dir=$(dirname "$file")
+                while [ "$dir" != "." ] && [ -d "$dir" ]; do
+                  if [ -z "$(find "$dir" -mindepth 1 -maxdepth 1)" ]; then
+                    rmdir "$dir" 2>/dev/null && echo "📁 删除空目录: $dir" || break
+                    dir=$(dirname "$dir")
+                  else
+                    break
+                  fi
+                done
+              else
+                echo "❌ 删除失败: $file"
+                error_count=$((error_count + 1))
+              fi
             else
-              echo "ℹ️ 文件不存在: $file"
+              echo "ℹ️ 文件不存在，跳过删除: $file"
             fi
           done < ../deleted_files.txt
         else
@@ -228,8 +304,13 @@ jobs:
         fi
         
         echo "actual_deleted_count=$deleted_count" >> $GITHUB_OUTPUT
-        printf "%s\n" "${safe_deleted_files[@]}" > ../actual_deleted_files.txt
-        echo "✅ 删除完成: $deleted_count 个文件"
+        echo "delete_errors=$error_count" >> $GITHUB_OUTPUT
+        
+        if [ $error_count -gt 0 ]; then
+          echo "⚠️ 删除完成: $deleted_count 个文件成功，$error_count 个错误"
+        else
+          echo "✅ 删除完成: $deleted_count 个文件"
+        fi
 
     - name: 📄 复制文件
       id: copy-files
@@ -238,26 +319,34 @@ jobs:
         
         echo "=== 复制文件到目标仓库 ==="
         copied_count=0
-        failed_files=()
+        error_count=0
         
         if [ -s ../modified_files.txt ]; then
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             
+            # 安全检查
+            if [[ "$file" == / || "$file" == /* || "$file" == .git* ]]; then
+              echo "❌ 安全错误: 拒绝复制不安全文件 '$file'"
+              error_count=$((error_count + 1))
+              continue
+            fi
+            
             if [ -f "$file" ]; then
               echo "📄 复制: $file"
               
+              # 创建目标目录
               mkdir -p "../target-repo/$(dirname "$file")"
               
               if cp --parents "$file" "../target-repo/"; then
                 copied_count=$((copied_count + 1))
               else
                 echo "❌ 复制失败: $file"
-                failed_files+=("$file")
+                error_count=$((error_count + 1))
               fi
             else
               echo "⚠️ 源文件不存在: $file"
-              failed_files+=("$file")
+              error_count=$((error_count + 1))
             fi
           done < ../modified_files.txt
         else
@@ -265,13 +354,13 @@ jobs:
         fi
         
         echo "actual_copied_count=$copied_count" >> $GITHUB_OUTPUT
+        echo "copy_errors=$error_count" >> $GITHUB_OUTPUT
         
-        if [ ${#failed_files[@]} -gt 0 ]; then
-          echo "failed_files_count=${#failed_files[@]}" >> $GITHUB_OUTPUT
-          printf "%s\n" "${failed_files[@]}" > ../failed_files.txt
+        if [ $error_count -gt 0 ]; then
+          echo "⚠️ 复制完成: $copied_count 个文件成功，$error_count 个错误"
+        else
+          echo "✅ 复制完成: $copied_count 个文件"
         fi
-        
-        echo "✅ 复制完成: $copied_count 个文件"
 
     - name: ✅ 验证结果
       id: verify-results
@@ -280,22 +369,17 @@ jobs:
         echo "提交数量: ${{ steps.resolve-commits.outputs.commits_count }}"
         echo "修改文件: ${{ steps.analyze-files.outputs.modified_files_count }}"
         echo "删除文件: ${{ steps.analyze-files.outputs.deleted_files_count }}"
-        echo "实际复制: ${{ steps.copy-files.outputs.actual_copied_count }}"
-        echo "实际删除: ${{ steps.delete-files.outputs.actual_deleted_count }}"
-        
-        if [ -n "${{ steps.copy-files.outputs.failed_files_count }}" ]; then
-          echo "失败文件: ${{ steps.copy-files.outputs.failed_files_count }}"
-        fi
+        echo "实际复制: ${{ steps.copy-files.outputs.actual_copied_count }} (错误: ${{ steps.copy-files.outputs.copy_errors }})"
+        echo "实际删除: ${{ steps.delete-files.outputs.actual_deleted_count }} (错误: ${{ steps.delete-files.outputs.delete_errors }})"
         
         cd target-repo
         echo "目标仓库文件数: $(find . -type f -not -path '*/\.git/*' | wc -l)"
         
-        # 验证Git身份配置
-        echo "=== Git身份验证 ==="
-        echo "用户名: $(git config user.name)"
-        echo "邮箱: $(git config user.email)"
+        # 验证Git状态
+        echo "=== Git状态 ==="
+        git status --short || echo "无法获取Git状态"
 
-    - name: 💾 提交变更（使用Mozi9_PAT身份）
+    - name: 💾 提交变更
       id: commit-changes
       run: |
         cd target-repo
@@ -304,8 +388,9 @@ jobs:
         git config user.name "mozi9"
         git config user.email "mozi9@users.noreply.github.com"
         
-        echo "=== 准备提交（使用Mozi9_PAT身份） ==="
+        echo "=== 准备提交 ==="
         
+        # 检查是否有变更
         if git diff-index --quiet HEAD --; then
           echo "ℹ️ 没有检测到文件变更"
           echo "has_changes=false" >> $GITHUB_OUTPUT
@@ -318,11 +403,6 @@ jobs:
           echo "=== 变更详情 ==="
           git status --short
           
-          # 验证提交人身份
-          echo "=== 提交人身份验证 ==="
-          echo "提交人姓名: $(git config user.name)"
-          echo "提交人邮箱: $(git config user.email)"
-          
           # 创建提交信息
           commit_msg="${{ github.event.inputs.commit_title }}"
           if [ -n "${{ github.event.inputs.commit_description }}" ]; then
@@ -330,53 +410,45 @@ jobs:
           fi
           
           # 使用环境变量强制设置提交者身份
-          GIT_AUTHOR_NAME="mozi9" GIT_AUTHOR_EMAIL="mozi9@users.noreply.github.com" \
-          GIT_COMMITTER_NAME="mozi9" GIT_COMMITTER_EMAIL="mozi9@users.noreply.github.com" \
+          export GIT_AUTHOR_NAME="mozi9"
+          export GIT_AUTHOR_EMAIL="mozi9@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="mozi9"
+          export GIT_COMMITTER_EMAIL="mozi9@users.noreply.github.com"
+          
           git commit -m "$commit_msg"
           
-          # 验证提交的作者信息
-          echo "=== 提交信息验证 ==="
-          git log -1 --pretty=fuller
-          
-          echo "✅ 提交创建成功（使用Mozi9_PAT身份）"
+          echo "✅ 提交创建成功"
         fi
 
-    - name: 🚀 推送更改（使用Mozi9_PAT令牌）
+    - name: 🚀 推送更改
       if: steps.commit-changes.outputs.has_changes == 'true'
       run: |
         cd target-repo
         
-        # 配置推送身份
-        git config user.name "mozi9"
-        git config user.email "mozi9@users.noreply.github.com"
+        echo "=== 推送到目标仓库 ==="
         
-        echo "=== 使用Mozi9_PAT推送到目标仓库 ==="
-        
-        # 配置远程URL使用令牌认证
-        target_repo_path=$(echo "${{ github.event.inputs.target_repo_url }}" | sed 's|https://github.com/||')
-        git remote set-url origin "https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/$target_repo_path"
+        # 配置远程URL（安全处理特殊字符）
+        target_repo_encoded="${{ github.event.inputs.target_repo }}"
+        git remote set-url origin "https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${target_repo_encoded}.git"
         
         # 先拉取最新更改避免冲突
         echo "正在拉取最新更改..."
         git pull origin "${{ github.event.inputs.target_branch }}" --rebase --no-edit
         
-        # 使用Mozi9_PAT推送
         echo "正在推送更改..."
         if git push origin "${{ github.event.inputs.target_branch }}"; then
-          echo "✅ 推送成功（使用Mozi9_PAT）"
-          
-          # 验证远程提交的作者信息
-          echo "=== 远程提交验证 ==="
-          git log -1 --pretty=fuller
+          echo "✅ 推送成功"
         else
-          echo "❌ 推送失败，请检查Mozi9_PAT权限"
+          echo "❌ 推送失败"
           exit 1
         fi
 
     - name: 📋 生成报告
       if: always()
       run: |
-        cat > "$GITHUB_STEP_SUMMARY" << EOF
+        summary_file="$GITHUB_STEP_SUMMARY"
+        
+        cat > "$summary_file" << EOF
         # 文件提取和提交结果
         
         ## 统计信息
@@ -386,18 +458,31 @@ jobs:
         - **成功复制**: ${{ steps.copy-files.outputs.actual_copied_count || '0' }}
         - **成功删除**: ${{ steps.delete-files.outputs.actual_deleted_count || '0' }}
         
-        ## 认证信息
-        - **使用的令牌**: Mozi9_PAT
-        - **提交人身份**: mozi9
-        - **提交人邮箱**: mozi9@users.noreply.github.com
+        ## 错误统计
+        - **复制错误**: ${{ steps.copy-files.outputs.copy_errors || '0' }}
+        - **删除错误**: ${{ steps.delete-files.outputs.delete_errors || '0' }}
         
-        ## 状态
+        ## 仓库信息
+        - **源仓库**: ${{ github.event.inputs.source_repo }}
+        - **源分支**: ${{ github.event.inputs.source_branch }}
+        - **目标仓库**: ${{ github.event.inputs.target_repo }}
+        - **目标分支**: ${{ github.event.inputs.target_branch }}
+        
+        ## 提交信息
+        - **标题**: ${{ github.event.inputs.commit_title }}
         EOF
         
+        if [ -n "${{ github.event.inputs.commit_description }}" ]; then
+          echo "        - **描述**: ${{ github.event.inputs.commit_description }}" >> "$summary_file"
+        fi
+        
+        echo "        " >> "$summary_file"
+        echo "## 操作结果" >> "$summary_file"
+        
         if [ "${{ steps.commit-changes.outputs.has_changes }}" = "true" ]; then
-          echo "✅ **操作成功完成** - 使用Mozi9_PAT令牌认证，所有提交均以mozi9身份进行" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ **操作成功完成** - 文件已提交并推送到目标仓库" >> "$summary_file"
         elif [ "${{ steps.commit-changes.outputs.has_changes }}" = "false" ]; then
-          echo "⚠️ **没有检测到变更**" >> "$GITHUB_STEP_SUMMARY"
+          echo "⚠️ **没有检测到变更** - 未创建提交" >> "$summary_file"
         else
-          echo "❌ **操作执行失败**" >> "$GITHUB_STEP_SUMMARY"
+          echo "❌ **操作执行失败** - 工作流执行过程中出现错误" >> "$summary_file"
         fi
