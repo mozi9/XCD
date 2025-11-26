@@ -1,74 +1,63 @@
-name: Manual File Extraction and Commit
+name: Manual File Extraction with Deletion Support
 
 on:
   workflow_dispatch:
     inputs:
-      source_repo:
-        description: "源仓库地址（所有者/仓库名）"
-        required: true
-        default: "sqldown/android_kernel_common_android12-5.10"
-      source_branch:
-        description: "从中获取提交的源分支"
-        required: true
-        default: "android_kernel_common_android12-5.10"
       source_commits:
-        description: "源提交哈希（短哈希或完整哈希，多个用逗号分隔）"
+        description: "Source commit hashes (short or full, comma separated)"
         required: true
         default: "41273ce"
-      target_repo:
-        description: "目标仓库地址（所有者/仓库名）"
+      source_branch:
+        description: "Source branch to get commits from"
         required: true
-        default: "mozi9/XCD"
+        default: "android16-aptusitu"
       target_branch:
-        description: "要推送到的目标分支"
+        description: "Target branch to push to"
         required: true
-        default: "miuix"
-      commit_title:
-        description: "提交信息的标题"
+        default: "main"
+      enable_deletion:
+        description: "Enable file deletion from target repository"
         required: true
-        default: "fs: 升级 SuSFS 版本到 v2.0.0"
-      commit_description:
-        description: "提交信息的详细描述（可选）"
-        required: false
-        default: "Co-authored-by: simonpunk <simonpunk2016@gmail.com>\nCo-authored-by: JackA1ltman <cs2dtzq@163.com>"
+        type: boolean
+        default: true
 
 env:
-  GIT_USERNAME: "github-actions[bot]"
-  GIT_EMAIL: "github-actions[bot]@users.noreply.github.com"
+  SOURCE_REPO: "ApartTUSITU/kernel_xiaomi_sm8250_mod"
+  TARGET_REPO: "你的用户名/你的目标仓库"
+  COMMIT_MESSAGE: "fs: Bump SuSFS version to v2.0.0"
+  COMMIT_DESCRIPTION: "Co-authored-by: simonpunk <simonpunk2016@gmail.com> o-authored-by: JackA1ltman <cs2dtzq@163.com>"
 
 jobs:
-  file-extraction-commit:
+  extract-and-commit:
     runs-on: ubuntu-latest
     steps:
-    - name: 📥 检出源仓库
+    - name: Checkout source repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ inputs.source_repo }}
+        repository: ${{ env.SOURCE_REPO }}
         ref: ${{ inputs.source_branch }}
-        token: ${{ secrets.GITHUB_TOKEN }}
+        token: ${{ secrets.PAT_TOKEN }}
         path: source-repo
         fetch-depth: 0
 
-    - name: 📥 检出目标仓库
+    - name: Checkout target repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ inputs.target_repo }}
+        repository: ${{ env.TARGET_REPO }}
         ref: ${{ inputs.target_branch }}
-        token: ${{ secrets.GITHUB_TOKEN }}
+        token: ${{ secrets.PAT_TOKEN }}
         path: target-repo
         fetch-depth: 0
 
-    - name: ⚙️ 配置Git身份
+    - name: Setup Git identity
       run: |
-        git config --global user.name "${{ env.GIT_USERNAME }}"
-        git config --global user.email "${{ env.GIT_EMAIL }}"
-        echo "Git身份已配置"
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
 
-    - name: 🔍 解析提交哈希
+    - name: Resolve commit hashes
       id: resolve-commits
       run: |
         cd source-repo
-        echo "正在解析提交哈希..."
         COMMITS=$(echo "${{ inputs.source_commits }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
         RESOLVED_COMMITS=""
         
@@ -76,167 +65,291 @@ jobs:
           FULL_HASH=$(git rev-parse "$commit" 2>/dev/null || echo "")
           if [ -n "$FULL_HASH" ]; then
             RESOLVED_COMMITS="$RESOLVED_COMMITS$FULL_HASH"$'\n'
-            echo "✅ 解析提交: $commit -> $FULL_HASH"
+            echo "✅ Resolved $commit -> $FULL_HASH"
           else
-            echo "❌ 错误: 无法解析提交 $commit"
+            echo "❌ Error: Cannot resolve commit $commit"
             exit 1
           fi
         done
         
         echo "$RESOLVED_COMMITS" | grep -v '^$' > ../resolved_commits.txt
-        echo "✅ 所有提交解析完成"
+        echo "Total resolved commits: $(cat ../resolved_commits.txt | wc -l)"
 
-    - name: 📊 分析文件变更
+    - name: Analyze file changes including deletions
       id: analyze-files
       run: |
         cd source-repo
         COMMITS=$(cat ../resolved_commits.txt)
         
+        echo "=== Analyzing file changes from commits ==="
+        echo "Commits to analyze:"
+        echo "$COMMITS"
+        
+        # 初始化文件列表
         ALL_MODIFIED_FILES=""
         ALL_DELETED_FILES=""
-        
-        echo "=== 开始分析文件变更 ==="
+        ALL_ADDED_FILES=""
         
         for commit in $COMMITS; do
-          echo "正在处理提交: $commit"
+          echo "📊 Processing commit: $commit"
           
-          MODIFIED_FILES=$(git show --name-status --format= $commit | awk '$1 == "A" || $1 == "M" {print $2}' | sort -u)
+          # 获取该commit的文件变更
+          COMMIT_CHANGES=$(git show --name-status --format=oneline $commit | head -1)
+          echo "Commit changes: $COMMIT_CHANGES"
+          
+          # 分析文件状态
+          ADDED_FILES=$(git show --name-status --format= $commit | awk '$1 == "A" {print $2}' | sort -u)
+          MODIFIED_FILES=$(git show --name-status --format= $commit | awk '$1 == "M" {print $2}' | sort -u)
           DELETED_FILES=$(git show --name-status --format= $commit | awk '$1 == "D" {print $2}' | sort -u)
+          RENAMED_FILES=$(git show --name-status --format= $commit | awk '$1 == "R100" {print $3}' | sort -u)
           
+          echo "Added: $(echo "$ADDED_FILES" | tr '\n' ' ')"
+          echo "Modified: $(echo "$MODIFIED_FILES" | tr '\n' ' ')"
+          echo "Deleted: $(echo "$DELETED_FILES" | tr '\n' ' ')"
+          echo "Renamed: $(echo "$RENAMED_FILES" | tr '\n' ' ')"
+          
+          # 合并文件列表
+          if [ -n "$ADDED_FILES" ]; then
+            ALL_ADDED_FILES="$ALL_ADDED_FILES"$'\n'"$ADDED_FILES"
+            ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$ADDED_FILES"
+          fi
           if [ -n "$MODIFIED_FILES" ]; then
             ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$MODIFIED_FILES"
           fi
           if [ -n "$DELETED_FILES" ]; then
             ALL_DELETED_FILES="$ALL_DELETED_FILES"$'\n'"$DELETED_FILES"
           fi
+          if [ -n "$RENAMED_FILES" ]; then
+            ALL_MODIFIED_FILES="$ALL_MODIFIED_FILES"$'\n'"$RENAMED_FILES"
+          fi
         done
         
+        # 去重和清理
+        UNIQUE_ADDED=$(echo "$ALL_ADDED_FILES" | grep -v '^$' | sort -u)
         UNIQUE_MODIFIED=$(echo "$ALL_MODIFIED_FILES" | grep -v '^$' | sort -u)
         UNIQUE_DELETED=$(echo "$ALL_DELETED_FILES" | grep -v '^$' | sort -u)
         
+        # 保存到文件
         echo "$UNIQUE_MODIFIED" > ../modified_files.txt
         echo "$UNIQUE_DELETED" > ../deleted_files.txt
+        echo "$UNIQUE_ADDED" > ../added_files.txt
         
         MOD_COUNT=$(echo "$UNIQUE_MODIFIED" | grep -c . || echo 0)
         DEL_COUNT=$(echo "$UNIQUE_DELETED" | grep -c . || echo 0)
+        ADD_COUNT=$(echo "$UNIQUE_ADDED" | grep -c . || echo 0)
         
         echo "modified_files_count=$MOD_COUNT" >> $GITHUB_OUTPUT
         echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+        echo "added_files_count=$ADD_COUNT" >> $GITHUB_OUTPUT
         
-        echo "✅ 分析完成: 修改文件 $MOD_COUNT 个, 删除文件 $DEL_COUNT 个"
+        echo "✅ Analysis completed:"
+        echo "   Modified/Added files: $MOD_COUNT"
+        echo "   Deleted files: $DEL_COUNT"
+        echo "   Added files: $ADD_COUNT"
 
-    - name: 🗑️ 删除目标文件
+    - name: Delete files from target repository
+      if: inputs.enable_deletion == true
       id: delete-files
       run: |
         cd target-repo
         
-        echo "=== 开始删除目标文件 ==="
+        echo "=== Processing file deletions ==="
         DELETED_COUNT=0
+        SKIPPED_COUNT=0
         
         if [ -s ../deleted_files.txt ]; then
           while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "$file" ]; then
-              if [[ "$file" != / && "$file" != /* && "$file" != .git* && "$file" != "." && "$file" != ".." ]]; then
-                echo "🗑️ 删除文件: $file"
-                rm -f "$file"
-                DELETED_COUNT=$((DELETED_COUNT + 1))
+            if [ -n "$file" ]; then
+              # 安全路径检查
+              if [[ "$file" =~ ^[a-zA-Z0-9_./-]+$ ]] && [[ "$file" != .git* ]] && [[ "$file" != "/"* ]]; then
+                if [ -f "$file" ]; then
+                  echo "🗑️ Deleting file: $file"
+                  rm -f "$file"
+                  DELETED_COUNT=$((DELETED_COUNT + 1))
+                  
+                  # 尝试删除空目录
+                  dir=$(dirname "$file")
+                  while [ "$dir" != "." ] && [ -d "$dir" ]; do
+                    if [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then
+                      rmdir "$dir" 2>/dev/null && echo "  📁 Removed empty directory: $dir" || break
+                      dir=$(dirname "$dir")
+                    else
+                      break
+                    fi
+                  done
+                  
+                elif [ -d "$file" ]; then
+                  echo "🗑️ Deleting directory: $file"
+                  rm -rf "$file"
+                  DELETED_COUNT=$((DELETED_COUNT + 1))
+                else
+                  echo "⚠️ Target not found (skip deletion): $file"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                fi
               else
-                echo "🚫 跳过（安全限制）: $file"
+                echo "🚫 Invalid path (skip deletion): $file"
+                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               fi
             fi
           done < ../deleted_files.txt
+        else
+          echo "ℹ️ No files to delete"
         fi
         
         echo "actual_deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
-        echo "✅ 删除完成: $DELETED_COUNT 个文件"
+        echo "skipped_deletion_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+        echo "✅ Deletion completed: $DELETED_COUNT deleted, $SKIPPED_COUNT skipped"
 
-    - name: 📄 复制修改文件到目标
+    - name: Copy modified/added files to target
       id: copy-files
       run: |
         cd source-repo
         git checkout ${{ inputs.source_branch }} --quiet
         
-        echo "=== 开始复制修改文件 ==="
+        echo "=== Copying modified/added files ==="
         COPIED_COUNT=0
+        FAILED_COUNT=0
+        SKIPPED_COUNT=0
         
         if [ -s ../modified_files.txt ]; then
           while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "$file" ]; then
-              echo "📄 复制文件: $file"
-              mkdir -p "../target-repo/$(dirname "$file")"
-              cp "$file" "../target-repo/$file"
-              COPIED_COUNT=$((COPIED_COUNT + 1))
+            if [ -n "$file" ]; then
+              # 安全路径检查
+              if [[ "$file" =~ ^[a-zA-Z0-9_./-]+$ ]] && [[ "$file" != .git* ]] && [[ "$file" != "/"* ]]; then
+                if [ -e "$file" ]; then
+                  echo "📄 Copying: $file"
+                  
+                  # 确保目标目录存在
+                  mkdir -p "../target-repo/$(dirname "$file")"
+                  
+                  # 复制文件或目录
+                  if [ -f "$file" ]; then
+                    if cp -f "$file" "../target-repo/$file"; then
+                      COPIED_COUNT=$((COPIED_COUNT + 1))
+                    else
+                      echo "❌ Failed to copy file: $file"
+                      FAILED_COUNT=$((FAILED_COUNT + 1))
+                    fi
+                  elif [ -d "$file" ]; then
+                    if cp -rf "$file" "../target-repo/$(dirname "$file")/"; then
+                      COPIED_COUNT=$((COPIED_COUNT + 1))
+                    else
+                      echo "❌ Failed to copy directory: $file"
+                      FAILED_COUNT=$((FAILED_COUNT + 1))
+                    fi
+                  fi
+                else
+                  echo "⚠️ Source not found: $file"
+                  SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                fi
+              else
+                echo "🚫 Invalid path: $file"
+                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              fi
             fi
           done < ../modified_files.txt
+        else
+          echo "ℹ️ No files to copy"
         fi
         
         echo "actual_copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
-        echo "✅ 复制完成: $COPIED_COUNT 个文件"
+        echo "failed_copy_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+        echo "skipped_copy_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+        echo "✅ Copy completed: $COPIED_COUNT copied, $FAILED_COUNT failed, $SKIPPED_COUNT skipped"
 
-    - name: ✅ 验证文件操作
+    - name: Verify file operations
       id: verify-files
       run: |
-        echo "=== 文件操作验证 ==="
-        echo "预期复制文件: $(cat modified_files.txt | wc -l) 个"
-        echo "预期删除文件: $(cat deleted_files.txt | wc -l) 个"
-        echo "实际复制文件: ${{ steps.copy-files.outputs.actual_copied_count }} 个"
-        echo "实际删除文件: ${{ steps.delete-files.outputs.actual_deleted_count }} 个"
+        echo "=== Verification Summary ==="
+        echo "Expected to modify/add: ${{ steps.analyze-files.outputs.modified_files_count }} files"
+        echo "Expected to delete: ${{ steps.analyze-files.outputs.deleted_files_count }} files"
+        echo "Actually copied: ${{ steps.copy-files.outputs.actual_copied_count }} files"
+        echo "Copy failed: ${{ steps.copy-files.outputs.failed_copy_count }} files"
+        echo "Copy skipped: ${{ steps.copy-files.outputs.skipped_copy_count }} files"
+        echo "Actually deleted: ${{ steps.delete-files.outputs.actual_deleted_count }} files"
+        echo "Deletion skipped: ${{ steps.delete-files.outputs.skipped_deletion_count }} files"
+        
+        echo ""
+        echo "=== Modified/Added files list ==="
+        cat modified_files.txt | head -10
+        if [ $(cat modified_files.txt | wc -l) -gt 10 ]; then
+          echo "... and $(($(cat modified_files.txt | wc -l) - 10)) more"
+        fi
+        
+        echo ""
+        echo "=== Deleted files list ==="
+        cat deleted_files.txt | head -10
+        if [ $(cat deleted_files.txt | wc -l) -gt 10 ]; then
+          echo "... and $(($(cat deleted_files.txt | wc -l) - 10)) more"
+        fi
         
         cd target-repo
-        echo "目标仓库文件总数: $(find . -type f -not -path '*/\.git/*' | wc -l)"
-        echo "Git状态:"
+        echo ""
+        echo "=== Target repository status ==="
         git status --short
 
-    - name: 💾 提交变更
+    - name: Commit all changes (including deletions)
       id: commit-changes
       run: |
         cd target-repo
         
+        # 添加所有变更（包括删除的文件）
         git add -A
+        
+        # 检查是否有变更
         if git diff --cached --quiet; then
-          echo "❌ 没有检测到文件变更"
+          echo "❌ No changes to commit"
           echo "has_changes=false" >> $GITHUB_OUTPUT
           exit 1
-        else
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-          echo "=== 将要提交的文件 ==="
-          git diff --cached --name-only
-          
-          git commit -m "${{ inputs.commit_title }}" -m "${{ inputs.commit_description }}"
-          echo "✅ 提交创建成功"
         fi
+        
+        echo "✅ Changes to be committed:"
+        git diff --cached --name-status
+        
+        # 创建提交信息，包含详细的变更统计
+        COMMIT_TITLE="${{ env.COMMIT_MESSAGE }}"
+        COMMIT_BODY="${{ env.COMMIT_DESCRIPTION }}"
+        COMMIT_BODY+=$'\n\n'"## File Operations Summary"
+        COMMIT_BODY+=$'\n'"- 📄 Copied/Modified: ${{ steps.copy-files.outputs.actual_copied_count }} files"
+        COMMIT_BODY+=$'\n'"- 🗑️ Deleted: ${{ steps.delete-files.outputs.actual_deleted_count }} files"
+        COMMIT_BODY+=$'\n'"- ⚠️ Copy failed: ${{ steps.copy-files.outputs.failed_copy_count }} files"
+        COMMIT_BODY+=$'\n'"- ⚠️ Deletion skipped: ${{ steps.delete-files.outputs.skipped_deletion_count }} files"
+        
+        # 提交变更
+        git commit -m "$COMMIT_TITLE" -m "$COMMIT_BODY"
+        
+        echo "has_changes=true" >> $GITHUB_OUTPUT
+        echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        echo "✅ Changes committed successfully"
 
-    - name: 🚀 推送到目标仓库
+    - name: Push to target repository
       if: steps.commit-changes.outputs.has_changes == 'true'
       run: |
         cd target-repo
         git push origin ${{ inputs.target_branch }}
-        echo "✅ 已推送到 ${{ inputs.target_repo }}:${{ inputs.target_branch }}"
+        echo "✅ Pushed to ${{ env.TARGET_REPO }}:${{ inputs.target_branch }}"
 
-    - name: 📋 显示最终结果
+    - name: Create summary report
       run: |
-        cat > $GITHUB_STEP_SUMMARY << 'EOF'
-        # 🎉 文件处理完成
+        cat > $GITHUB_STEP_SUMMARY << EOF
+        # 文件同步完成报告
         
-        ## 📊 操作统计
-        - **分析的修改文件**: ${{ steps.analyze-files.outputs.modified_files_count }} 个
-        - **分析的删除文件**: ${{ steps.analyze-files.outputs.deleted_files_count }} 个
+        ## 操作统计
+        - **分析出的修改/新增文件**: ${{ steps.analyze-files.outputs.modified_files_count }} 个
+        - **分析出的删除文件**: ${{ steps.analyze-files.outputs.deleted_files_count }} 个
         - **实际复制的文件**: ${{ steps.copy-files.outputs.actual_copied_count }} 个
         - **实际删除的文件**: ${{ steps.delete-files.outputs.actual_deleted_count }} 个
+        - **复制失败的文件**: ${{ steps.copy-files.outputs.failed_copy_count }} 个
+        - **删除跳过的文件**: ${{ steps.delete-files.outputs.skipped_deletion_count }} 个
         
-        ## 🔧 仓库配置
-        - **源仓库**: ${{ inputs.source_repo }}
-        - **源分支**: ${{ inputs.source_branch }}
-        - **目标仓库**: ${{ inputs.target_repo }}
+        ## 提交信息
+        - **提交SHA**: ${{ steps.commit-changes.outputs.commit_sha }}
         - **目标分支**: ${{ inputs.target_branch }}
         
-        ## 📝 提交信息
-        - **标题**: ${{ inputs.commit_title }}
-        - **描述**: ${{ inputs.commit_description }}
         EOF
         
         if [ "${{ steps.commit-changes.outputs.has_changes }}" = "true" ]; then
-          echo "✅ **操作成功**: 已成功处理 ${{ steps.copy-files.outputs.actual_copied_count }} 个文件并推送到目标仓库" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **同步成功**: 已完成文件覆盖合并，包含删除操作" >> $GITHUB_STEP_SUMMARY
         else
-          echo "❌ **操作失败**: 没有检测到文件变更" >> $GITHUB_STEP_SUMMARY
+          echo "❌ **同步失败**: 未检测到文件变更" >> $GITHUB_STEP_SUMMARY
         fi
