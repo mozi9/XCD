@@ -16,9 +16,9 @@ on:
         required: true
         default: "47b6de7"
       source_branch:
-        description: "源分支"
+        description: "源分支（可以是main/master/具体分支名）"
         required: true
-        default: "android16-aptusitu-new"
+        default: "main"
       target_branch:
         description: "目标分支"
         required: true
@@ -72,25 +72,43 @@ jobs:
         path: target-repo
         fetch-depth: 1
 
-    - name: 🔍 智能查找提交和文件
-      id: smart-analyze
+    - name: 🔍 智能查找提交（支持主分支）
+      id: smart-search
       run: |
-        echo "=== 智能查找提交和文件 ==="
+        echo "=== 智能查找提交（支持主分支） ==="
         
         REPO="${{ github.event.inputs.source_repo }}"
         BRANCH="${{ github.event.inputs.source_branch }}"
-        COMMITS=$(echo "${{ github.event.inputs.source_commits }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+        COMMIT_HASH="${{ github.event.inputs.source_commits }}"
         
-        echo "查找提交: $COMMITS"
+        echo "搜索提交: $COMMIT_HASH"
         echo "在分支: $BRANCH"
+        echo "仓库: $REPO"
         
         # 存储结果
         all_files=()
         resolved_commits=()
-        error_count=0
         
-        # 首先获取分支的最新提交
-        echo "获取分支 $BRANCH 的信息..."
+        # 1. 检测默认分支（如果是main/master）
+        echo "1. 检测分支信息..."
+        if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+          echo "   ℹ️ 检测到主分支: $BRANCH"
+          # 获取仓库的默认分支
+          repo_url="https://api.github.com/repos/$REPO"
+          repo_response=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "$repo_url")
+          
+          if echo "$repo_response" | grep -q '"default_branch"'; then
+            default_branch=$(echo "$repo_response" | grep '"default_branch"' | cut -d'"' -f4)
+            echo "   ✅ 仓库默认分支: $default_branch"
+            BRANCH="$default_branch"  # 使用实际的默认分支
+          fi
+        fi
+        
+        # 2. 检查分支是否存在
+        echo "2. 检查分支 $BRANCH 是否存在..."
         branch_url="https://api.github.com/repos/$REPO/branches/$BRANCH"
         branch_response=$(curl -s \
           -H "Accept: application/vnd.github.v3+json" \
@@ -99,115 +117,118 @@ jobs:
         
         if echo "$branch_response" | grep -q '"name"'; then
           branch_sha=$(echo "$branch_response" | grep '"sha"' | head -1 | cut -d'"' -f4)
-          echo "✅ 分支 $BRANCH 最新提交: ${branch_sha:0:8}"
+          echo "   ✅ 分支 $BRANCH 存在，最新提交: ${branch_sha:0:8}"
         else
-          echo "❌ 无法获取分支 $BRANCH 信息"
-          echo "响应: $branch_response"
+          echo "   ❌ 分支 $BRANCH 不存在"
+          
+          # 列出可用的分支
+          echo "   📋 可用的分支:"
+          branches_url="https://api.github.com/repos/$REPO/branches?per_page=20"
+          branches_response=$(curl -s \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "$branches_url")
+          
+          echo "$branches_response" | grep '"name"' | cut -d'"' -f4 | while read branch; do
+            echo "     - $branch"
+          done
+          
           exit 1
         fi
         
-        # 搜索提交
-        for commit in $COMMITS; do
-          echo "搜索提交: $commit"
+        # 3. 查找提交（多种方法）
+        echo "3. 查找提交 $COMMIT_HASH ..."
+        found_commit=""
+        
+        # 方法A: 直接查询
+        echo "   A. 直接查询提交..."
+        commit_url="https://api.github.com/repos/$REPO/commits/$COMMIT_HASH"
+        commit_response=$(curl -s \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "$commit_url")
+        
+        if echo "$commit_response" | grep -q '"sha"'; then
+          sha=$(echo "$commit_response" | grep '"sha"' | head -1 | cut -d'"' -f4)
+          echo "   ✅ 直接找到提交: $COMMIT_HASH -> ${sha:0:8}"
+          found_commit="$sha"
+        else
+          echo "   ❌ 直接查询失败"
           
-          # 方法1: 直接通过API获取提交
-          api_url="https://api.github.com/repos/$REPO/commits/$commit"
-          response=$(curl -s \
+          # 方法B: 在分支中搜索提交
+          echo "   B. 在分支 $BRANCH 中搜索提交..."
+          commits_url="https://api.github.com/repos/$REPO/commits?sha=$BRANCH&per_page=100"
+          commits_response=$(curl -s \
             -H "Accept: application/vnd.github.v3+json" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "$api_url")
+            "$commits_url")
           
-          if echo "$response" | grep -q '"sha"'; then
-            # 提交存在
-            sha=$(echo "$response" | grep '"sha"' | head -1 | cut -d'"' -f4)
-            echo "✅ 找到提交: $commit -> ${sha:0:8}"
-            resolved_commits+=("$sha")
-            
-            # 提取文件
-            files=$(echo "$response" | grep '"filename"' | cut -d'"' -f4)
-            if [ -n "$files" ]; then
-              while IFS= read -r file; do
-                if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
-                  all_files+=("$file")
-                  echo "📄 $file"
-                fi
-              done <<< "$files"
-            fi
+          # 查找匹配的提交
+          found_in_branch=$(echo "$commits_response" | grep -o "\"sha\":\"[^\"]*$COMMIT_HASH[^\"]*\"" | head -1 | cut -d'"' -f4)
+          
+          if [ -n "$found_in_branch" ]; then
+            echo "   ✅ 在分支中找到提交: $COMMIT_HASH -> ${found_in_branch:0:8}"
+            found_commit="$found_in_branch"
           else
-            # 方法2: 搜索提交
-            echo "尝试搜索提交 $commit..."
-            search_url="https://api.github.com/search/commits?q=repo:$REPO+$commit"
+            echo "   ❌ 在分支中未找到提交"
+            
+            # 方法C: 全局搜索
+            echo "   C. 全局搜索提交..."
+            search_url="https://api.github.com/search/commits?q=repo:$REPO+$COMMIT_HASH&per_page=5"
             search_response=$(curl -s \
               -H "Accept: application/vnd.github.cloak-preview+json" \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               "$search_url")
             
-            if echo "$search_response" | grep -q '"total_count"' && echo "$search_response" | grep -q '"sha"'; then
-              search_sha=$(echo "$search_response" | grep '"sha"' | head -1 | cut -d'"' -f4)
-              echo "✅ 搜索到提交: $commit -> ${search_sha:0:8}"
-              resolved_commits+=("$search_sha")
-              
-              # 获取提交详情
-              commit_url="https://api.github.com/repos/$REPO/commits/$search_sha"
-              commit_response=$(curl -s \
-                -H "Accept: application/vnd.github.v3+json" \
-                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "$commit_url")
-              
-              files=$(echo "$commit_response" | grep '"filename"' | cut -d'"' -f4)
-              if [ -n "$files" ]; then
-                while IFS= read -r file; do
-                  if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
-                    all_files+=("$file")
-                    echo "📄 $file"
-                  fi
-                done <<< "$files"
+            if echo "$search_response" | grep -q '"total_count"'; then
+              total_count=$(echo "$search_response" | grep '"total_count"' | cut -d':' -f2 | tr -d ' ,')
+              if [ "$total_count" -gt 0 ]; then
+                echo "   ✅ 搜索到 $total_count 个匹配的提交"
+                search_sha=$(echo "$search_response" | grep '"sha"' | head -1 | cut -d'"' -f4)
+                echo "   ✅ 使用提交: ${search_sha:0:8}"
+                found_commit="$search_sha"
+              else
+                echo "   ❌ 搜索无结果"
               fi
             else
-              # 方法3: 获取分支提交历史，查找匹配的提交
-              echo "在分支历史中查找提交 $commit..."
-              commits_url="https://api.github.com/repos/$REPO/commits?sha=$BRANCH&per_page=100"
-              commits_response=$(curl -s \
-                -H "Accept: application/vnd.github.v3+json" \
-                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "$commits_url")
-              
-              # 在提交历史中查找匹配的短哈希
-              found_commit=$(echo "$commits_response" | grep -o "\"sha\":\"[^\"]*$commit[^\"]*\"" | head -1 | cut -d'"' -f4)
-              
-              if [ -n "$found_commit" ]; then
-                echo "✅ 在历史中找到提交: $commit -> ${found_commit:0:8}"
-                resolved_commits+=("$found_commit")
-                
-                # 获取提交详情
-                commit_url="https://api.github.com/repos/$REPO/commits/$found_commit"
-                commit_response=$(curl -s \
-                  -H "Accept: application/vnd.github.v3+json" \
-                  -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                  "$commit_url")
-                
-                files=$(echo "$commit_response" | grep '"filename"' | cut -d'"' -f4)
-                if [ -n "$files" ]; then
-                  while IFS= read -r file; do
-                    if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
-                      all_files+=("$file")
-                      echo "📄 $file"
-                    fi
-                  done <<< "$files"
-                fi
-              else
-                echo "❌ 无法找到提交: $commit"
-                error_count=$((error_count + 1))
-              fi
+              echo "   ❌ 搜索失败"
             fi
           fi
-        done
-        
-        if [ $error_count -gt 0 ]; then
-          echo "❌ 共发现 $error_count 个错误，无法继续"
-          exit 1
         fi
         
+        # 4. 如果没有找到提交，使用分支最新提交
+        if [ -z "$found_commit" ]; then
+          echo "4. 使用分支最新提交作为备选..."
+          found_commit="$branch_sha"
+          echo "   ✅ 使用分支最新提交: ${found_commit:0:8}"
+        fi
+        
+        resolved_commits+=("$found_commit")
+        
+        # 5. 获取提交的文件列表
+        echo "5. 获取提交 ${found_commit:0:8} 的文件列表..."
+        final_commit_url="https://api.github.com/repos/$REPO/commits/$found_commit"
+        final_response=$(curl -s \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "$final_commit_url")
+        
+        if echo "$final_response" | grep -q '"filename"'; then
+          files=$(echo "$final_response" | grep '"filename"' | cut -d'"' -f4 | sort -u)
+          file_count=$(echo "$files" | wc -l)
+          echo "   ✅ 找到 $file_count 个文件"
+          
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [[ ! " ${all_files[@]} " =~ " ${file} " ]]; then
+              all_files+=("$file")
+              echo "     📄 $file"
+            fi
+          done <<< "$files"
+        else
+          echo "   ❌ 无法获取文件列表"
+        fi
+        
+        # 6. 保存结果
         if [ ${#all_files[@]} -eq 0 ]; then
           echo "⚠️ 未发现变更文件"
           touch file_list.txt
@@ -218,10 +239,13 @@ jobs:
         
         if [ ${#resolved_commits[@]} -gt 0 ]; then
           printf "%s\n" "${resolved_commits[@]}" > commits.txt
+          echo "✅ 使用的提交: ${resolved_commits[0]:0:8}"
         fi
         
         echo "commits_count=${#resolved_commits[@]}" >> $GITHUB_OUTPUT
         echo "files_count=${#all_files[@]}" >> $GITHUB_OUTPUT
+        echo "actual_commit=${resolved_commits[0]}" >> $GITHUB_OUTPUT
+        echo "actual_branch=$BRANCH" >> $GITHUB_OUTPUT
         echo "✅ 分析完成"
 
     - name: 📥 按需下载源文件
@@ -237,7 +261,9 @@ jobs:
         fi
         
         REPO="${{ github.event.inputs.source_repo }}"
-        BRANCH="${{ github.event.inputs.source_branch }}"
+        BRANCH="${{ steps.smart-search.outputs.actual_branch }}"
+        
+        echo "下载文件，分支: $BRANCH"
         
         # 创建源文件目录
         mkdir -p source-files
@@ -343,7 +369,19 @@ jobs:
           git status --short
           
           # 创建提交信息
+          original_commit="${{ github.event.inputs.source_commits }}"
+          actual_commit="${{ steps.smart-search.outputs.actual_commit }}"
+          actual_branch="${{ steps.smart-search.outputs.actual_branch }}"
+          
           commit_msg="${{ github.event.inputs.commit_title }}"
+          
+          # 添加提交信息详情
+          if [ "$original_commit" != "${actual_commit:0:${#original_commit}}" ]; then
+            commit_msg="$commit_msg (基于提交 ${actual_commit:0:8}，分支: $actual_branch)"
+          else
+            commit_msg="$commit_msg (分支: $actual_branch)"
+          fi
+          
           if [ -n "${{ github.event.inputs.commit_description }}" ]; then
             commit_msg="$commit_msg"$'\n'$'\n'"${{ github.event.inputs.commit_description }}"
           fi
@@ -375,27 +413,40 @@ jobs:
           echo "✅ 冲突解决并推送成功"
         fi
 
-    - name: 📋 生成报告
+    - name: 📋 生成详细报告
       if: always()
       run: |
         cat > "$GITHUB_STEP_SUMMARY" << EOF
-        # 智能文件提取完成
+        # 文件提取完成报告
         
-        ## 执行统计
-        - **处理提交**: ${{ steps.smart-analyze.outputs.commits_count || '0' }}
-        - **发现文件**: ${{ steps.smart-analyze.outputs.files_count || '0' }}
-        - **下载文件**: ${{ steps.download-files.outputs.actual_downloaded || '0' }} (${{ steps.download-files.outputs.download_errors || '0' }} 失败)
-        - **同步文件**: ${{ steps.sync-files.outputs.actual_copied || '0' }} (${{ steps.sync-files.outputs.sync_errors || '0' }} 失败)
+        ## 执行摘要
+        - **请求的提交**: ${{ github.event.inputs.source_commits }}
+        - **实际使用的提交**: ${{ steps.smart-search.outputs.actual_commit || '未找到' }}
+        - **实际使用的分支**: ${{ steps.smart-search.outputs.actual_branch || '未确定' }}
+        - **发现文件数量**: ${{ steps.smart-search.outputs.files_count || '0' }}
+        - **下载成功文件**: ${{ steps.download-files.outputs.actual_downloaded || '0' }}
+        - **同步成功文件**: ${{ steps.sync-files.outputs.actual_copied || '0' }}
         - **提交状态**: ${{ steps.create-commit.outputs.has_changes == 'true' && '✅ 已提交' || '⚠️ 无变更' }}
         
-        ## 技术说明
-        本方案使用智能搜索策略查找提交：
-        1. 直接API查询
-        2. 全局搜索
-        3. 分支历史搜索
-        
-        **预计执行时间**: 1-3分钟
+        ## 分支处理
         EOF
+        
+        if [[ "${{ github.event.inputs.source_branch }}" == "main" || "${{ github.event.inputs.source_branch }}" == "master" ]]; then
+          echo "✅ **主分支处理**: 自动检测并使用仓库的默认分支" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        
+        if [ "${{ github.event.inputs.source_commits }}" != "${{ steps.smart-search.outputs.actual_commit }}" ]; then
+          echo "⚠️ **提交哈希不匹配**: 请求的提交 '${{ github.event.inputs.source_commits }}' 不存在，使用了备选提交 '${{ steps.smart-search.outputs.actual_commit }}'" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "## 建议" >> "$GITHUB_STEP_SUMMARY"
+        echo "1. 检查提交哈希是否正确" >> "$GITHUB_STEP_SUMMARY"
+        echo "2. 确认提交存在于分支 ${{ steps.smart-search.outputs.actual_branch }} 中" >> "$GITHUB_STEP_SUMMARY"
+        echo "3. 可以尝试使用完整的40字符提交哈希" >> "$GITHUB_STEP_SUMMARY"
+        
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "**执行时间**: 预计1-2分钟" >> "$GITHUB_STEP_SUMMARY"
 
     - name: 🧹 清理临时文件
       if: always()
