@@ -207,13 +207,21 @@ jobs:
         echo "$UNIQUE_MODIFIED" > ../modified_files.txt
         echo "$UNIQUE_DELETED" > ../deleted_files.txt
         
-        # 修复输出变量设置
-        MOD_COUNT=$(echo "$UNIQUE_MODIFIED" | grep -c . || echo 0)
-        DEL_COUNT=$(echo "$UNIQUE_DELETED" | grep -c . || echo 0)
+        # 修复：使用更安全的方法计算文件数量
+        MOD_COUNT=0
+        DEL_COUNT=0
         
-        # 正确设置输出变量
-        echo "modified_files_count=$MOD_COUNT" >> $GITHUB_OUTPUT
-        echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+        if [ -s ../modified_files.txt ]; then
+          MOD_COUNT=$(wc -l < ../modified_files.txt | tr -d ' ')
+        fi
+        
+        if [ -s ../deleted_files.txt ]; then
+          DEL_COUNT=$(wc -l < ../deleted_files.txt | tr -d ' ')
+        fi
+        
+        # 设置输出变量
+        echo "modified_files_count=${MOD_COUNT}" >> $GITHUB_OUTPUT
+        echo "deleted_files_count=${DEL_COUNT}" >> $GITHUB_OUTPUT
         
         echo "✅ Analysis complete:"
         echo "   Modified/Added: $MOD_COUNT files"
@@ -262,8 +270,7 @@ jobs:
           done < ../deleted_files.txt
         fi
         
-        # 修复输出变量设置
-        echo "actual_deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+        echo "actual_deleted_count=${DELETED_COUNT}" >> $GITHUB_OUTPUT
         echo "✅ Deleted $DELETED_COUNT files"
 
     - name: Copy files to target
@@ -287,8 +294,7 @@ jobs:
           done < ../modified_files.txt
         fi
         
-        # 修复输出变量设置
-        echo "actual_copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
+        echo "actual_copied_count=${COPIED_COUNT}" >> $GITHUB_OUTPUT
         echo "✅ Copied $COPIED_COUNT files"
 
     - name: Prepare commit message
@@ -312,8 +318,8 @@ jobs:
         # 添加文件统计信息和提交详情
         FULL_DESC="$COMMIT_DESC\n\nSource commits:\n$COMMIT_DETAILS\n\nFile operations:\n- Copied: ${{ steps.analyze-changes.outputs.modified_files_count }} files\n- Deleted: ${{ steps.analyze-changes.outputs.deleted_files_count }} files\n\nSource: ${{ inputs.source_repo_url }}\nBranch: ${{ inputs.source_branch }}"
         
-        echo "commit_title=$COMMIT_TITLE" >> $GITHUB_OUTPUT
-        echo "commit_description=$FULL_DESC" >> $GITHUB_OUTPUT
+        echo "commit_title=${COMMIT_TITLE}" >> $GITHUB_OUTPUT
+        echo "commit_description=${FULL_DESC}" >> $GITHUB_OUTPUT
         
         echo "=== Commit Message ==="
         echo "Title: $COMMIT_TITLE"
