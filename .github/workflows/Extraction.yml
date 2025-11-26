@@ -1,36 +1,36 @@
-name: Manual File Extraction and Commit
+name: File Extraction and Commit
 
 on:
   workflow_dispatch:
     inputs:
-      source_repo:
-        description: "源仓库地址（所有者/仓库名）"
+      source_repo_url:
+        description: "源仓库URL"
         required: true
-        default: "sqldown/android_kernel_common_android12-5.10"
+        default: "https://github.com/ApartTUSITU/kernel_xiaomi_sm8250_mod"
+      target_repo_url:
+        description: "目标仓库URL"
+        required: true
+        default: "https://github.com/mozi9/XCD"
+      source_commits:
+        description: "源仓库提交哈希（逗号分隔，支持短哈希或完整哈希）"
+        required: true
+        default: "47b6de7"
       source_branch:
-        description: "从中获取提交的源分支"
+        description: "源分支"
         required: true
         default: "android_kernel_common_android12-5.10"
-      source_commits:
-        description: "源提交哈希（短哈希或完整哈希，多个用逗号分隔）"
-        required: true
-        default: "41273ce"
-      target_repo:
-        description: "目标仓库地址（所有者/仓库名）"
-        required: true
-        default: "mozi9/XCD"
       target_branch:
-        description: "要推送到的目标分支"
+        description: "目标分支"
         required: true
         default: "miuix"
       commit_title:
-        description: "提交信息的标题"
+        description: "提交标题"
         required: true
-        default: "fs: 升级 SuSFS 版本到 v2.0.0"
+        default: "fs: Bump SuSFS version to v2.0.0"
       commit_description:
-        description: "提交信息的详细描述（可选）"
+        description: "提交描述（可选）"
         required: false
-        default: "Co-authored-by: simonpunk <simonpunk2016@gmail.com>\nCo-authored-by: JackA1ltman <cs2dtzq@163.com>"
+        default: ""
 
 env:
   GIT_USERNAME: "github-actions[bot]"
