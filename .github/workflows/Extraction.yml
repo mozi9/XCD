@@ -65,7 +65,7 @@ jobs:
     - name: 📥 检出源仓库（使用Mozi9_PAT）
       uses: actions/checkout@v4
       with:
-        repository: ${{ fromJSON(format('{{0}}', github.event.inputs.source_repo_url)) }}
+        repository: ${{ github.event.inputs.source_repo_url }}
         ref: ${{ github.event.inputs.source_branch }}
         token: ${{ secrets.Mozi9_PAT }}
         path: source-repo
@@ -74,7 +74,7 @@ jobs:
     - name: 📥 检出目标仓库（使用Mozi9_PAT）
       uses: actions/checkout@v4
       with:
-        repository: ${{ fromJSON(format('{{0}}', github.event.inputs.target_repo_url)) }}
+        repository: ${{ github.event.inputs.target_repo_url }}
         ref: ${{ github.event.inputs.target_branch }}
         token: ${{ secrets.Mozi9_PAT }}
         path: target-repo
@@ -84,13 +84,7 @@ jobs:
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
-        
-        # 配置Git使用Mozi9_PAT进行认证
-        git config --global credential.helper store
-        echo "https://mozi9:${{ secrets.Mozi9_PAT }}@github.com" > ~/.git-credentials
-        
         echo "✅ Git身份已配置为: mozi9 <mozi9@users.noreply.github.com>"
-        echo "✅ 已配置Mozi9_PAT令牌认证"
 
     - name: 🔍 解析提交哈希
       id: resolve-commits
@@ -359,39 +353,30 @@ jobs:
         echo "=== 使用Mozi9_PAT推送到目标仓库 ==="
         
         # 配置远程URL使用令牌认证
-        git remote set-url origin https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.repository_owner }}/$(echo ${{ github.event.inputs.target_repo_url }} | sed 's|https://github.com/||')
+        target_repo_path=$(echo "${{ github.event.inputs.target_repo_url }}" | sed 's|https://github.com/||')
+        git remote set-url origin "https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/$target_repo_path"
         
         # 先拉取最新更改避免冲突
         echo "正在拉取最新更改..."
-        git pull origin ${{ github.event.inputs.target_branch }} --rebase --no-edit
+        git pull origin "${{ github.event.inputs.target_branch }}" --rebase --no-edit
         
         # 使用Mozi9_PAT推送
         echo "正在推送更改..."
-        if git push origin ${{ github.event.inputs.target_branch }}; then
+        if git push origin "${{ github.event.inputs.target_branch }}"; then
           echo "✅ 推送成功（使用Mozi9_PAT）"
           
           # 验证远程提交的作者信息
           echo "=== 远程提交验证 ==="
           git log -1 --pretty=fuller
-          echo "=== 推送身份验证 ==="
-          git remote -v
         else
           echo "❌ 推送失败，请检查Mozi9_PAT权限"
           exit 1
         fi
 
-    - name: 🔐 清理凭据
-      if: always()
-      run: |
-        echo "=== 清理Git凭据 ==="
-        rm -f ~/.git-credentials
-        git config --global --unset credential.helper
-        echo "✅ Git凭据已清理"
-
     - name: 📋 生成报告
       if: always()
       run: |
-        cat > $GITHUB_STEP_SUMMARY << EOF
+        cat > "$GITHUB_STEP_SUMMARY" << EOF
         # 文件提取和提交结果
         
         ## 统计信息
@@ -410,9 +395,9 @@ jobs:
         EOF
         
         if [ "${{ steps.commit-changes.outputs.has_changes }}" = "true" ]; then
-          echo "✅ **操作成功完成** - 使用Mozi9_PAT令牌认证，所有提交均以mozi9身份进行" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **操作成功完成** - 使用Mozi9_PAT令牌认证，所有提交均以mozi9身份进行" >> "$GITHUB_STEP_SUMMARY"
         elif [ "${{ steps.commit-changes.outputs.has_changes }}" = "false" ]; then
-          echo "⚠️ **没有检测到变更**" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **没有检测到变更**" >> "$GITHUB_STEP_SUMMARY"
         else
-          echo "❌ **操作执行失败**" >> $GITHUB_STEP_SUMMARY
+          echo "❌ **操作执行失败**" >> "$GITHUB_STEP_SUMMARY"
         fi
