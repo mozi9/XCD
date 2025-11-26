@@ -152,7 +152,7 @@ jobs:
             exit 1
           else
             # 没有匹配
-            echo "❌ Error: Cannot resolve commit '$commit"
+            echo "❌ Error: Cannot resolve commit '$commit'"
             exit 1
           fi
         done
@@ -207,9 +207,11 @@ jobs:
         echo "$UNIQUE_MODIFIED" > ../modified_files.txt
         echo "$UNIQUE_DELETED" > ../deleted_files.txt
         
+        # 修复输出变量设置
         MOD_COUNT=$(echo "$UNIQUE_MODIFIED" | grep -c . || echo 0)
         DEL_COUNT=$(echo "$UNIQUE_DELETED" | grep -c . || echo 0)
         
+        # 正确设置输出变量
         echo "modified_files_count=$MOD_COUNT" >> $GITHUB_OUTPUT
         echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
         
@@ -260,6 +262,7 @@ jobs:
           done < ../deleted_files.txt
         fi
         
+        # 修复输出变量设置
         echo "actual_deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
         echo "✅ Deleted $DELETED_COUNT files"
 
@@ -284,6 +287,7 @@ jobs:
           done < ../modified_files.txt
         fi
         
+        # 修复输出变量设置
         echo "actual_copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
         echo "✅ Copied $COPIED_COUNT files"
 
