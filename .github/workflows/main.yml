@@ -1,18 +1,15 @@
-name: Sync Repository Branch
+name: Sync Repository from Source
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址 (格式: owner/repo)'
+        description: '源仓库 (格式: owner/repo)'
         required: true
         type: string
+        default: 'mozi9/MIUI'
       source_branch:
         description: '源分支名称 (留空使用默认分支)'
-        required: false
-        type: string
-      target_repo:
-        description: '目标仓库地址 (格式: owner/repo，留空使用当前仓库)'
         required: false
         type: string
         default: ''
@@ -20,96 +17,110 @@ on:
         description: '目标分支名称'
         required: true
         type: string
-      source_path:
-        description: '要同步的源仓库路径 (留空同步整个仓库)'
+        default: 'sync-from-source'
+      force_push:
+        description: '是否强制推送'
         required: false
-        type: string
-        default: ''
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+        default: 'false'
 
 env:
-  PAT_TOKEN: ${{ secrets.Mozi9_PAT }}
+  # 使用当前工作流程的令牌，或者自定义 PAT
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   sync-repository:
-    name: Sync Repository Branch
+    name: Sync from ${{ github.event.inputs.source_repo }}
     runs-on: ubuntu-latest
     
     steps:
-    - name: Determine target repository
-      id: target_info
-      run: |
-        if [ -z "${{ github.event.inputs.target_repo }}" ]; then
-          echo "target_repo=${{ github.repository }}" >> $GITHUB_OUTPUT
-        else
-          echo "target_repo=${{ github.event.inputs.target_repo }}" >> $GITHUB_OUTPUT
-        fi
-
     - name: Checkout target repository
       uses: actions/checkout@v4
       with:
-        token: ${{ env.PAT_TOKEN }}
-        repository: ${{ steps.target_info.outputs.target_repo }}
-        ref: ${{ github.event.inputs.target_branch }}
+        token: ${{ env.GITHUB_TOKEN }}
         fetch-depth: 0
 
-    - name: Determine source default branch
-      id: source_info
-      if: inputs.source_branch == ''
+    - name: Get source repository default branch
+      id: get_source
       run: |
-        # 获取源仓库的默认分支
-        default_branch=$(curl -s -H "Authorization: token ${{ env.PAT_TOKEN }}" \
-          "https://api.github.com/repos/${{ github.event.inputs.source_repo }}" | \
-          jq -r .default_branch)
-        echo "default_branch=$default_branch" >> $GITHUB_OUTPUT
-        echo "Using default branch: $default_branch"
-
-    - name: Set source branch
-      id: set_branch
-      run: |
+        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
+        
+        # 如果未指定源分支，自动获取默认分支
         if [ -z "${{ github.event.inputs.source_branch }}" ]; then
-          echo "source_branch=${{ steps.source_info.outputs.default_branch }}" >> $GITHUB_OUTPUT
+          echo "Detecting default branch for $SOURCE_REPO..."
+          
+          # 使用 GitHub API 获取默认分支
+          DEFAULT_BRANCH=$(curl -s \
+            -H "Authorization: token ${{ env.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$SOURCE_REPO" | \
+            jq -r '.default_branch // "main"')
+          
+          # 如果 API 调用失败，使用默认值
+          if [ "$DEFAULT_BRANCH" = "null" ] || [ -z "$DEFAULT_BRANCH" ]; then
+            DEFAULT_BRANCH="main"
+          fi
+          
+          echo "source_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          echo "Using default branch: $DEFAULT_BRANCH"
         else
           echo "source_branch=${{ github.event.inputs.source_branch }}" >> $GITHUB_OUTPUT
+          echo "Using specified branch: ${{ github.event.inputs.source_branch }}"
         fi
 
     - name: Add source repository as remote
       run: |
-        git remote add source https://${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.source_repo }}.git
-        git fetch source ${{ steps.set_branch.outputs.source_branch }} --depth=1
+        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
+        SOURCE_BRANCH="${{ steps.get_source.outputs.source_branch }}"
+        
+        echo "Adding source remote: $SOURCE_REPO"
+        git remote add source "https://github.com/$SOURCE_REPO.git"
+        
+        echo "Fetching source branch: $SOURCE_BRANCH"
+        git fetch source "$SOURCE_BRANCH" --depth=1
 
-    - name: Create and checkout target branch
+    - name: Create or update target branch
       run: |
+        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+        SOURCE_BRANCH="${{ steps.get_source.outputs.source_branch }}"
+        
         # 检查目标分支是否存在
-        if git show-ref --verify --quiet refs/heads/${{ github.event.inputs.target_branch }}; then
-          echo "Target branch exists, switching to it"
-          git checkout ${{ github.event.inputs.target_branch }}
-          git merge --ff-only source/${{ steps.set_branch.outputs.source_branch }} || \
-            { echo "Fast-forward merge failed, performing regular merge"; git merge --no-edit source/${{ steps.set_branch.outputs.source_branch }}; }
+        if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+          echo "Target branch '$TARGET_BRANCH' exists, updating..."
+          git checkout "$TARGET_BRANCH"
+          git reset --hard "source/$SOURCE_BRANCH"
         else
-          echo "Creating new target branch"
-          git checkout -b ${{ github.event.inputs.target_branch }} source/${{ steps.set_branch.outputs.source_branch }}
+          echo "Creating new target branch: $TARGET_BRANCH"
+          git checkout -b "$TARGET_BRANCH" "source/$SOURCE_BRANCH"
         fi
-
-    - name: Sync specific path (if specified)
-      if: github.event.inputs.source_path != ''
-      run: |
-        # 如果指定了路径，只同步特定路径
-        git checkout source/${{ steps.set_branch.outputs.source_branch }} -- ${{ github.event.inputs.source_path }}
-        git add ${{ github.event.inputs.source_path }}
 
     - name: Configure Git identity
       run: |
-        git config user.name "mozi9"
-        git config user.email "mozi9"
-
-    - name: Commit changes
-      run: |
-        if git diff --cached --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Sync from ${{ github.event.inputs.source_repo }}:${{ steps.set_branch.outputs.source_branch }} to ${{ steps.target_info.outputs.target_repo }}:${{ github.event.inputs.target_branch }}"
-        fi
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
 
     - name: Push to target repository
       run: |
-        git push https://${{ env.PAT_TOKEN }}@github.com/${{ steps.target_info.outputs.target_repo }}.git ${{ github.event.inputs.target_branch }} --force-with-lease
+        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+        FORCE_PUSH="${{ github.event.inputs.force_push }}"
+        
+        if [ "$FORCE_PUSH" = "true" ]; then
+          echo "Force pushing to $TARGET_BRANCH"
+          git push origin "$TARGET_BRANCH" --force
+        else
+          echo "Pushing to $TARGET_BRANCH with lease"
+          git push origin "$TARGET_BRANCH" --force-with-lease
+        fi
+
+    - name: Display sync summary
+      run: |
+        echo "✅ Sync completed successfully!"
+        echo "📦 Source: ${{ github.event.inputs.source_repo }}:${{ steps.get_source.outputs.source_branch }}"
+        echo "🎯 Target: ${{ github.repository }}:${{ github.event.inputs.target_branch }}"
+        echo "📊 Latest commit:"
+        git log -1 --oneline
+        echo ""
+        echo "🔗 Branch URL: https://github.com/${{ github.repository }}/tree/${{ github.event.inputs.target_branch }}"
