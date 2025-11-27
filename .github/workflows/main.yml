@@ -11,6 +11,11 @@ on:
         description: '源分支名称 (留空使用默认分支)'
         required: false
         type: string
+      target_repo:
+        description: '目标仓库地址 (格式: owner/repo，留空使用当前仓库)'
+        required: false
+        type: string
+        default: ''
       target_branch:
         description: '目标分支名称'
         required: true
@@ -30,10 +35,21 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+    - name: Determine target repository
+      id: target_info
+      run: |
+        if [ -z "${{ github.event.inputs.target_repo }}" ]; then
+          echo "target_repo=${{ github.repository }}" >> $GITHUB_OUTPUT
+        else
+          echo "target_repo=${{ github.event.inputs.target_repo }}" >> $GITHUB_OUTPUT
+        fi
+
     - name: Checkout target repository
       uses: actions/checkout@v4
       with:
         token: ${{ env.PAT_TOKEN }}
+        repository: ${{ steps.target_info.outputs.target_repo }}
+        ref: ${{ github.event.inputs.target_branch }}
         fetch-depth: 0
 
     - name: Determine source default branch
@@ -91,9 +107,9 @@ jobs:
         if git diff --cached --quiet; then
           echo "No changes to commit"
         else
-          git commit -m "Sync from ${{ github.event.inputs.source_repo }}:${{ steps.set_branch.outputs.source_branch }}"
+          git commit -m "Sync from ${{ github.event.inputs.source_repo }}:${{ steps.set_branch.outputs.source_branch }} to ${{ steps.target_info.outputs.target_repo }}:${{ github.event.inputs.target_branch }}"
         fi
 
-    - name: Push changes
+    - name: Push to target repository
       run: |
-        git push origin ${{ github.event.inputs.target_branch }} --force-with-lease
+        git push https://${{ env.PAT_TOKEN }}@github.com/${{ steps.target_info.outputs.target_repo }}.git ${{ github.event.inputs.target_branch }} --force-with-lease
