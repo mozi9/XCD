@@ -1,10 +1,10 @@
-name: Simple Repo Sync
+name: 🔄 Quick Repo Sync
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址'
+        description: '源仓库 (owner/repo)'
         required: true
         type: string
       source_branch:
@@ -13,11 +13,11 @@ on:
         default: 'main'
         type: string
       target_repo:
-        description: '目标仓库地址'
+        description: '目标仓库 (owner/repo)'
         required: true
         type: string
-      target_branch:
-        description: '目标分支名'
+      new_branch:
+        description: '新分支名'
         required: true
         default: 'sync-branch'
         type: string
@@ -28,26 +28,24 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: 🔄 同步仓库
-      run: |
-        # 配置Git
-        git config --global user.name "mozi9"
-        git config --global user.email "mozi9"
-        
-        # 克隆源仓库
-        git clone --depth 1 \
-          -b "${{ github.event.inputs.source_branch }}" \
-          "https://mozi9:$PAT_TOKEN@github.com/${{{ github.event.inputs.source_repo '#https://github.com/' }}}" \
-          source-repo
+      - name: 🔄 同步代码
+        run: |
+          # 配置git
+          git config --global user.name "mozi9"
+          git config --global user.email "mozi9"
           
-        cd source-repo
-        
-        # 推送到目标仓库
-        git push "https://mozi9:$PAT_TOKEN@github.com/${{{ github.event.inputs.target_repo '#https://github.com/' }}}" \
-          HEAD:refs/heads/"${{ github.event.inputs.target_branch }}"
-        
-        echo "✅ 同步完成！"
-        echo "分支: ${{ github.event.inputs.target_branch }}"
-        echo "链接: https://github.com/${{{ github.event.inputs.target_repo '#https://github.com/' }}}/tree/${{ github.event.inputs.target_branch }}"
+          # 克隆源仓库
+          git clone --depth 1 \
+            -b "${{ github.event.inputs.source_branch }}" \
+            "https://mozi9:${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.source_repo }}.git" \
+            source
+          
+          # 推送到目标仓库
+          cd source
+          git push \
+            "https://mozi9:${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.target_repo }}.git" \
+            HEAD:refs/heads/${{ github.event.inputs.new_branch }}
+          
+          echo "✅ 完成！分支: ${{ github.event.inputs.new_branch }}"
+          echo "🔗 https://github.com/${{ github.event.inputs.target_repo }}/tree/${{ github.event.inputs.new_branch }}"
