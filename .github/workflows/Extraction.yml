@@ -1,14 +1,14 @@
-name: Correct File Sync
+name: Direct Commit Override
 
 on:
   workflow_dispatch:
     inputs:
       commit_urls:
-        description: "GitHub提交链接"
+        description: "GitHub提交链接（多个链接用逗号分隔）"
         required: true
         default: "https://github.com/android16-aptusit/kernel_xiaomi_sm8250_mod/commit/47b6de7"
       target_repo:
-        description: "目标仓库"
+        description: "目标仓库（格式：owner/repo）"
         required: true
         default: "mozi9/XCD"
       target_branch:
@@ -19,22 +19,25 @@ on:
         description: "提交标题"
         required: true
         default: "fs: Bump SuSFS version to v2.0.0"
+      commit_description:
+        description: "提交描述（可选）"
+        required: false
+        default: ""
 
 env:
   GIT_USERNAME: "mozi9"
   GIT_EMAIL: "mozi9@users.noreply.github.com"
 
 jobs:
-  correct-file-sync:
+  direct-override:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-    - name: 🔧 安装工具
-      run: sudo apt-get install -y jq
-
-    - name: ⚙️ 配置Git
+    - name: ⚙️ 配置Git环境
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
+        git config --global core.autocrlf false
 
     - name: 📥 检出目标仓库
       uses: actions/checkout@v4
@@ -43,150 +46,302 @@ jobs:
         ref: ${{ github.event.inputs.target_branch }}
         token: ${{ secrets.Mozi9_PAT }}
         path: target-repo
+        fetch-depth: 0  # 获取完整历史
 
-    - name: 🔍 解析正确的仓库信息
-      id: parse-repo
+    - name: 🔍 解析提交链接
+      id: parse-commit
       run: |
-        echo "=== 使用正确的仓库信息 ==="
+        echo "=== 解析提交链接 ==="
         
-        # 从图片中获取正确的仓库信息
-        SOURCE_REPO="android16-aptusit/kernel_xiaomi_sm8250_mod"
-        COMMIT_HASH="47b6de7"  # 或其他正确的提交哈希
+        COMMIT_URLS="${{ github.event.inputs.commit_urls }}"
         
-        echo "源仓库: $SOURCE_REPO"
-        echo "提交: $COMMIT_HASH"
+        # 清理和分割链接
+        COMMIT_URLS_CLEAN=$(echo "$COMMIT_URLS" | tr ',' '\n' | tr ' ' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+        
+        # 存储所有提交信息
+        all_commits=()
+        all_repos=()
+        
+        while IFS= read -r commit_url; do
+          if [[ "$commit_url" =~ https://github.com/([^/]+)/([^/]+)/commit/([a-f0-9]+) ]]; then
+            REPO_OWNER="${BASH_REMATCH[1]}"
+            REPO_NAME="${BASH_REMATCH[2]}"
+            COMMIT_HASH="${BASH_REMATCH[3]}"
+            REPO="$REPO_OWNER/$REPO_NAME"
+            
+            echo "✅ 解析成功: $REPO @ $COMMIT_HASH"
+            all_commits+=("$COMMIT_HASH")
+            all_repos+=("$REPO")
+          else
+            echo "❌ 链接格式错误: $commit_url"
+            exit 1
+          fi
+        done <<< "$COMMIT_URLS_CLEAN"
+        
+        if [ ${#all_commits[@]} -eq 0 ]; then
+          echo "❌ 没有有效的提交链接"
+          exit 1
+        fi
+        
+        # 保存结果
+        printf "%s\n" "${all_commits[@]}" > commit_hashes.txt
+        printf "%s\n" "${all_repos[@]}" > repo_names.txt
+        
+        echo "commits_count=${#all_commits[@]}" >> $GITHUB_OUTPUT
+
+    - name: 🔄 添加源仓库远程
+      id: add-remote
+      run: |
+        cd target-repo
+        
+        readarray -t COMMITS < ../commit_hashes.txt
+        readarray -t REPOS < ../repo_names.txt
+        
+        if [ ${#COMMITS[@]} -eq 0 ]; then
+          echo "❌ 没有提交信息"
+          exit 1
+        fi
+        
+        # 使用第一个仓库
+        SOURCE_REPO="${REPOS[0]}"
+        COMMIT_HASH="${COMMITS[0]}"
+        
+        echo "添加远程仓库: $SOURCE_REPO"
+        echo "目标提交: $COMMIT_HASH"
+        
+        # 添加源仓库为远程
+        git remote add source-repo "https://github.com/$SOURCE_REPO.git"
+        
+        # 获取源仓库数据
+        git fetch source-repo "$COMMIT_HASH"
         
         echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
         echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
 
-    - name: 📥 克隆正确的源仓库
-      id: clone-source
-      run: |
-        SOURCE_REPO="${{ steps.parse-repo.outputs.source_repo }}"
-        COMMIT_HASH="${{ steps.parse-repo.outputs.commit_hash }}"
-        
-        echo "克隆仓库: $SOURCE_REPO"
-        echo "检出提交: $COMMIT_HASH"
-        
-        # 克隆源仓库
-        git clone --depth 1 "https://github.com/$SOURCE_REPO.git" source-repo
-        cd source-repo
-        git checkout "$COMMIT_HASH"
-        
-        # 检查文件是否存在
-        echo "=== 检查文件存在性 ==="
-        
-        # 检查已知存在的文件
-        CHECK_FILES=(
-          "include/linux/sched.h.orig"
-          "fs/dcache.c.orig"
-          "fs/namei.c.orig"
-          "fs/namespace.c.orig"
-          "fs/proc/base.c.orig"
-          "fs/proc/fd.c.orig"
-          "fs/proc/task_mmu.c.orig"
-          "fs/sus_su.c"
-          "fs/susfs.c"
-          "include/linux/sus_su.h"
-          "include/linux/susfs.h"
-          "include/linux/susfs_def.h"
-          "kernel/kallsyms.c.orig"
-          "kernel/sys.c.orig"
-        )
-        
-        for file in "${CHECK_FILES[@]}"; do
-          if [ -f "$file" ]; then
-            echo "✅ 文件存在: $file"
-            echo "$file" >> existing_files.txt
-          else
-            echo "❌ 文件不存在: $file"
-            echo "$file" >> missing_files.txt
-          fi
-        done
-
-    - name: 📋 获取提交中的文件列表
+    - name: 📊 获取提交文件变更
       id: get-commit-files
-      run: |
-        SOURCE_REPO="${{ steps.parse-repo.outputs.source_repo }}"
-        COMMIT_HASH="${{ steps.parse-repo.outputs.commit_hash }}"
-        
-        echo "获取提交 $COMMIT_HASH 的文件变更..."
-        
-        # 获取提交详情
-        commit_url="https://api.github.com/repos/$SOURCE_REPO/commits/$COMMIT_HASH"
-        commit_response=$(curl -s -H "Accept: application/vnd.github.v3+json" "$commit_url")
-        
-        # 提取所有文件
-        echo "$commit_response" | jq -r '.files[].filename' > all_commit_files.txt
-        
-        echo "提交中的文件:"
-        cat all_commit_files.txt
-
-    - name: 🔄 同步所有文件
-      id: sync-all-files
-      run: |
-        echo "=== 同步文件 ==="
-        
-        # 复制所有在源仓库中存在的文件
-        copied_count=0
-        missing_count=0
-        
-        if [ -s all_commit_files.txt ]; then
-          while IFS= read -r file; do
-            if [ -f "source-repo/$file" ]; then
-              # 创建目录并复制文件
-              mkdir -p "target-repo/$(dirname "$file")"
-              cp "source-repo/$file" "target-repo/$file"
-              copied_count=$((copied_count + 1))
-              echo "✅ 复制: $file"
-            else
-              missing_count=$((missing_count + 1))
-              echo "❌ 源文件不存在: $file"
-            fi
-          done < all_commit_files.txt
-        fi
-        
-        echo "copied_count=$copied_count" >> $GITHUB_OUTPUT
-        echo "missing_count=$missing_count" >> $GITHUB_OUTPUT
-
-    - name: 💾 提交变更
       run: |
         cd target-repo
         
-        if ! git diff-index --quiet HEAD --; then
-          git add -A
-          git commit -m "${{ github.event.inputs.commit_title }}"
-          git push origin "${{ github.event.inputs.target_branch }}"
-          echo "✅ 变更已提交"
+        SOURCE_REPO="${{ steps.add-remote.outputs.source_repo }}"
+        COMMIT_HASH="${{ steps.add-remote.outputs.commit_hash }}"
+        
+        echo "=== 获取提交文件变更 ==="
+        echo "分析提交: $COMMIT_HASH"
+        
+        # 获取提交中的文件变更
+        git diff --name-only "$COMMIT_HASH^" "$COMMIT_HASH" > ../changed_files.txt
+        
+        # 获取新增和修改的文件
+        git diff --name-only --diff-filter=AM "$COMMIT_HASH^" "$COMMIT_HASH" > ../added_modified_files.txt
+        
+        # 获取删除的文件
+        git diff --name-only --diff-filter=D "$COMMIT_HASH^" "$COMMIT_HASH" > ../deleted_files.txt
+        
+        # 获取所有变更文件
+        git show --name-only --pretty=format:"" "$COMMIT_HASH" | grep -v '^$' > ../all_files.txt
+        
+        echo "✅ 文件变更分析完成"
+        echo "所有文件: $(wc -l < ../all_files.txt) 个"
+        echo "新增/修改: $(wc -l < ../added_modified_files.txt) 个"
+        echo "删除文件: $(wc -l < ../deleted_files.txt) 个"
+
+    - name: 🗑️ 删除目标仓库中的文件
+      id: delete-files
+      run: |
+        cd target-repo
+        
+        echo "=== 删除提交中标记为删除的文件 ==="
+        
+        deleted_count=0
+        error_count=0
+        
+        if [ -s ../deleted_files.txt ]; then
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            
+            if [ -f "$file" ]; then
+              if rm -f "$file"; then
+                deleted_count=$((deleted_count + 1))
+                echo "🗑️  删除: $file"
+                
+                # 尝试删除空目录
+                dir=$(dirname "$file")
+                while [ "$dir" != "." ] && [ -d "$dir" ]; do
+                  if [ -z "$(ls -A "$dir")" ]; then
+                    rmdir "$dir" 2>/dev/null && echo "📁 删除空目录: $dir" || break
+                    dir=$(dirname "$dir")
+                  else
+                    break
+                  fi
+                done
+              else
+                error_count=$((error_count + 1))
+                echo "❌ 删除失败: $file"
+              fi
+            else
+              echo "⏭️  跳过删除: $file (文件不存在)"
+            fi
+          done < ../deleted_files.txt
+        fi
+        
+        echo "deleted_count=$deleted_count" >> $GITHUB_OUTPUT
+        echo "✅ 删除完成: $deleted_count 个文件"
+
+    - name: 📥 检出提交文件到目标仓库
+      id: checkout-files
+      run: |
+        cd target-repo
+        
+        COMMIT_HASH="${{ steps.add-remote.outputs.commit_hash }}"
+        
+        echo "=== 检出提交文件到工作区 ==="
+        echo "检出提交: $COMMIT_HASH"
+        
+        added_count=0
+        modified_count=0
+        error_count=0
+        
+        if [ -s ../added_modified_files.txt ]; then
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            
+            echo "处理文件: $file"
+            
+            # 创建目录
+            mkdir -p "$(dirname "$file")"
+            
+            # 从提交中检出文件
+            if git show "$COMMIT_HASH:$file" > "$file" 2>/dev/null; then
+              if [ -s "$file" ]; then
+                if [ -f "$file" ]; then
+                  modified_count=$((modified_count + 1))
+                  echo "✏️  修改: $file"
+                else
+                  added_count=$((added_count + 1))
+                  echo "➕ 新增: $file"
+                fi
+              else
+                error_count=$((error_count + 1))
+                echo "❌ 文件为空: $file"
+                rm -f "$file"
+              fi
+            else
+              error_count=$((error_count + 1))
+              echo "❌ 检出失败: $file"
+            fi
+          done < ../added_modified_files.txt
+        fi
+        
+        echo "added_count=$added_count" >> $GITHUB_OUTPUT
+        echo "modified_count=$modified_count" >> $GITHUB_OUTPUT
+        echo "error_count=$error_count" >> $GITHUB_OUTPUT
+        
+        echo "✅ 检出完成:"
+        echo "   新增文件: $added_count 个"
+        echo "   修改文件: $modified_count 个"
+        echo "   错误操作: $error_count 个"
+
+    - name: 💾 提交变更
+      id: commit-changes
+      run: |
+        cd target-repo
+        
+        echo "=== 提交变更 ==="
+        
+        # 检查是否有变更
+        if git diff-index --quiet HEAD --; then
+          echo "ℹ️ 没有检测到文件变更"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
         else
-          echo "ℹ️ 无变更可提交"
+          echo "📝 发现变更，准备提交..."
+          
+          # 显示变更状态
+          echo "=== 变更状态 ==="
+          git status --porcelain
+          
+          # 添加所有变更
+          git add -A
+          
+          # 获取变更统计
+          CHANGED_FILES=$(git diff --name-only --cached)
+          CHANGED_COUNT=$(echo "$CHANGED_FILES" | wc -l)
+          
+          echo "变更文件 ($CHANGED_COUNT 个):"
+          echo "$CHANGED_FILES"
+          
+          # 创建提交信息
+          commit_msg="${{ github.event.inputs.commit_title }}"
+          
+          if [ -n "${{ github.event.inputs.commit_description }}" ]; then
+            commit_msg="$commit_msg"$'\n'$'\n'"${{ github.event.inputs.commit_description }}"
+          fi
+          
+          # 提交
+          git commit -m "$commit_msg"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "changed_files_count=$CHANGED_COUNT" >> $GITHUB_OUTPUT
+          echo "✅ 提交创建成功"
         fi
 
-    - name: 📊 生成准确报告
+    - name: 🚀 推送更改
+      if: steps.commit-changes.outputs.has_changes == 'true'
+      run: |
+        cd target-repo
+        
+        echo "=== 推送更改 ==="
+        
+        git push origin "${{ github.event.inputs.target_branch }}"
+        echo "✅ 推送成功"
+
+    - name: 📋 生成报告
+      if: always()
       run: |
         cat > "$GITHUB_STEP_SUMMARY" << EOF
-        # 准确文件同步报告
+        # 直接提交覆盖报告
         
-        ## 文件存在性检查
+        ## 总体统计
+        - **源仓库**: ${{ steps.add-remote.outputs.source_repo }}
+        - **源提交**: ${{ steps.add-remote.outputs.commit_hash }}
+        - **删除文件**: ${{ steps.delete-files.outputs.deleted_count }} 个
+        - **新增文件**: ${{ steps.checkout-files.outputs.added_count }} 个
+        - **修改文件**: ${{ steps.checkout-files.outputs.modified_count }} 个
+        - **最终提交**: ${{ steps.commit-changes.outputs.changed_files_count || '0' }} 个文件
+        - **操作状态**: ${{ steps.commit-changes.outputs.has_changes == 'true' && '✅ 成功提交' || 'ℹ️ 无变更' }}
+        
+        ## 详细操作
         EOF
         
-        if [ -f existing_files.txt ]; then
-          echo "### ✅ 实际存在的文件 ($(wc -l < existing_files.txt) 个)" >> "$GITHUB_STEP_SUMMARY"
-          cat existing_files.txt >> "$GITHUB_STEP_SUMMARY"
+        # 显示删除的文件
+        if [ -s deleted_files.txt ]; then
+          echo "### 🗑️ 删除的文件 (${{ steps.delete-files.outputs.deleted_count }} 个)" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r file; do
+            echo "- \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+          done < deleted_files.txt
           echo "" >> "$GITHUB_STEP_SUMMARY"
         fi
         
-        if [ -f missing_files.txt ]; then
-          echo "### ❌ 不存在的文件 ($(wc -l < missing_files.txt) 个)" >> "$GITHUB_STEP_SUMMARY"
-          cat missing_files.txt >> "$GITHUB_STEP_SUMMARY"
+        # 显示新增/修改的文件
+        if [ -s added_modified_files.txt ]; then
+          echo "### 📄 新增/修改的文件 ($(({{ steps.checkout-files.outputs.added_count }} + {{ steps.checkout-files.outputs.modified_count }})) 个)" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r file; do
+            echo "- \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+          done < added_modified_files.txt
           echo "" >> "$GITHUB_STEP_SUMMARY"
         fi
         
         cat >> "$GITHUB_STEP_SUMMARY" << EOF
-        ## 同步结果
-        - **成功复制**: ${{ steps.sync-all-files.outputs.copied_count }} 个文件
-        - **缺失文件**: ${{ steps.sync-all-files.outputs.missing_count }} 个文件
+        ## 方法说明
+        - **直接检出**: 使用git show从源提交直接检出文件
+        - **强制覆盖**: 无视文件冲突，直接覆盖
+        - **精确同步**: 只处理提交中实际变更的文件
         
-        ## 问题解决
-        使用正确的仓库路径: \`android16-aptusit/kernel_xiaomi_sm8250_mod\`
+        **执行时间**: 预计1-2分钟
         EOF
+
+    - name: 🧹 清理
+      if: always()
+      run: |
+        cd target-repo
+        git remote remove source-repo 2>/dev/null || true
+        rm -f ../commit_hashes.txt ../repo_names.txt ../changed_files.txt ../added_modified_files.txt ../deleted_files.txt ../all_files.txt 2>/dev/null || true
