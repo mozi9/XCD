@@ -1,186 +1,220 @@
-name: Complete Commit Sync Workflow
+name: Manual Repository Sync - Cherry-pick with Mozi9 Identity
 
 on:
   workflow_dispatch:
     inputs:
-      source_commit_url:
-        description: "源提交链接"
+      source_repo:
+        description: '源仓库地址 (格式: owner/repo)'
         required: true
-        default: "https://github.com/android16-aptusit/kernel_xiaomi_sm8250_mod/commit/47b6de7"
+        default: 'owner/source-repo'
       target_repo:
-        description: "目标仓库"
+        description: '目标仓库地址 (格式: owner/repo)'
         required: true
-        default: "mozi9/XCD"
+        default: 'owner/target-repo'
+      source_branch:
+        description: '源分支名'
+        required: true
+        default: 'main'
       target_branch:
-        description: "目标分支"
+        description: '目标分支名'
         required: true
-        default: "miuix"
-      commit_message:
-        description: "提交信息"
+        default: 'main'
+      start_commit:
+        description: '开始同步的提交哈希 (完整哈希)'
+        required: false
+      max_commits:
+        description: '最大同步提交数量'
         required: true
-        default: "fs: Bump SuSFS version to v2.0.0"
+        default: '10'
 
 env:
-  GIT_USERNAME: "mozi9"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  step1-push-commit:
+  sync-repository:
     runs-on: ubuntu-latest
-    outputs:
-      commit_hash: ${{ steps.parse-commit.outputs.commit_hash }}
-      source_repo: ${{ steps.parse-commit.outputs.source_repo }}
-    
     steps:
-    - name: 配置Git
-      run: |
-        git config --global user.name "mozi9"
-        git config --global user.email "mozi9@users.noreply.github.com"
-
-    - name: 克隆目标仓库
+    - name: Checkout target repository
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
-        ref: ${{ github.event.inputs.target_branch }}
         token: ${{ secrets.Mozi9_PAT }}
+        ref: ${{ github.event.inputs.target_branch }}
         fetch-depth: 0
 
-    - name: 解析提交链接
-      id: parse-commit
+    - name: Add source repository as remote
       run: |
-        COMMIT_URL="${{ github.event.inputs.source_commit_url }}"
-        if [[ "$COMMIT_URL" =~ github.com/([^/]+)/([^/]+)/commit/([a-f0-9]+) ]]; then
-          echo "commit_hash=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
-          echo "source_repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
-        fi
+        git remote add source-repo https://github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source-repo ${{ github.event.inputs.source_branch }} --depth=100
 
-    - name: 添加源仓库远程
-      run: |
-        git remote add source-repo https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-commit.outputs.source_repo }}.git
-        git fetch source-repo ${{ steps.parse-commit.outputs.commit_hash }}
-
-    - name: 强制推送提交到目标仓库
-      run: |
-        COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
-        git reset --hard $COMMIT_HASH
-        git push --force origin ${{ github.event.inputs.target_branch }}
-        echo "✅ 提交已推送到目标仓库"
-
-  step2-get-commit-files:
-    runs-on: ubuntu-latest
-    needs: step1-push-commit
-    outputs:
-      added_files: ${{ steps.analyze-files.outputs.added_files }}
-      modified_files: ${{ steps.analyze-files.outputs.modified_files }}
-      deleted_files: ${{ steps.analyze-files.outputs.deleted_files }}
-    
-    steps:
-    - name: 配置Git
+    - name: Setup Git config for Mozi9
       run: |
         git config --global user.name "mozi9"
-        git config --global user.email "mozi9@users.noreply.github.com"
+        git config --global user.email "mozi9"
 
-    - name: 克隆目标仓库
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ github.event.inputs.target_repo }}
-        ref: ${{ github.event.inputs.target_branch }}
-        token: ${{ secrets.Mozi9_PAT }}
-        fetch-depth: 0
-
-    - name: 分析提交文件变更
-      id: analyze-files
+    - name: Get commit list to sync
+      id: get_commits
       run: |
-        COMMIT_HASH="${{ needs.step1-push-commit.outputs.commit_hash }}"
-        
-        # 获取父提交
-        PARENT_COMMIT=$(git log --pretty=%P -n 1 $COMMIT_HASH | awk '{print $1}')
-        
-        if [ -n "$PARENT_COMMIT" ]; then
-          # 新增和修改的文件
-          git diff --name-only --diff-filter=AM $PARENT_COMMIT $COMMIT_HASH > added_files.txt
-          # 删除的文件
-          git diff --name-only --diff-filter=D $PARENT_COMMIT $COMMIT_HASH > deleted_files.txt
-          
-          echo "added_files=added_files.txt" >> $GITHUB_OUTPUT
-          echo "deleted_files=deleted_files.txt" >> $GITHUB_OUTPUT
-          echo "新增/修改文件: $(wc -l < added_files.txt)"
-          echo "删除文件: $(wc -l < deleted_files.txt)"
+        # 获取完整提交哈希列表
+        if [ -n "${{ github.event.inputs.start_commit }}" ]; then
+          # 验证start_commit是否存在
+          if ! git rev-parse ${{ github.event.inputs.start_commit }} >/dev/null 2>&1; then
+            echo "错误: 提交 ${{ github.event.inputs.start_commit }} 不存在"
+            exit 1
+          fi
+          # 从指定提交开始，获取之后的提交
+          COMMITS=$(git log --reverse --format=%H ${{ github.event.inputs.start_commit }}..source-repo/${{ github.event.inputs.source_branch }} | head -n ${{ github.event.inputs.max_commits }})
         else
-          # 初始提交
-          git ls-tree -r --name-only $COMMIT_HASH > added_files.txt
-          touch deleted_files.txt
-          echo "added_files=added_files.txt" >> $GITHUB_OUTPUT
-          echo "deleted_files=deleted_files.txt" >> $GITHUB_OUTPUT
-          echo "初始提交，所有文件为新增: $(wc -l < added_files.txt)"
+          # 从最新提交开始，获取指定数量的提交
+          COMMITS=$(git log --reverse --format=%H -n ${{ github.event.inputs.max_commits }} source-repo/${{ github.event.inputs.source_branch }})
         fi
+        
+        # 计算提交数量
+        if [ -z "$COMMITS" ]; then
+          COMMIT_COUNT=0
+        else
+          COMMIT_COUNT=$(echo "$COMMITS" | wc -l)
+        fi
+        
+        if [ "$COMMIT_COUNT" -eq 0 ]; then
+          echo "没有找到需要同步的提交"
+          exit 1
+        fi
+        
+        echo "找到 $COMMIT_COUNT 个需要同步的提交"
+        echo "提交列表:"
+        echo "$COMMITS" | while read commit; do
+          git log -1 --oneline $commit
+        done
+        
+        # 保存完整哈希列表到文件
+        echo "$COMMITS" > /tmp/commit_list.txt
+        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
 
-  step3-process-target-files:
-    runs-on: ubuntu-latest
-    needs: step2-get-commit-files
-    steps:
-    - name: 配置Git
+    - name: Cherry-pick commits with Mozi9 identity
       run: |
-        git config --global user.name "mozi9"
-        git config --global user.email "mozi9@users.noreply.github.com"
-
-    - name: 检出目标仓库
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ github.event.inputs.target_repo }}
-        ref: ${{ github.event.inputs.target_branch }}
-        token: ${{ secrets.Mozi9_PAT }}
-        fetch-depth: 0
-
-    - name: 在目标仓库中删除文件
-      run: |
-        if [ -f "${{ needs.step2-get-commit-files.outputs.deleted_files }}" ]; then
-          while IFS= read -r file; do
-            if [ -n "$file" ] && [ -f "$file" ]; then
-              rm -f "$file"
-              echo "删除: $file"
+        COMMITS=$(cat /tmp/commit_list.txt)
+        I=1
+        TOTAL=${{ steps.get_commits.outputs.commit_count }}
+        
+        for COMMIT in $COMMITS; do
+          echo "================================================================="
+          echo "正在cherry-pick提交 $I/$TOTAL: $COMMIT"
+          
+          # 获取提交信息（只保留提交消息）
+          COMMIT_MESSAGE=$(git log -1 --format=%s $COMMIT)
+          echo "提交信息: $COMMIT_MESSAGE"
+          
+          # 尝试cherry-pick，冲突时直接使用源提交的文件
+          set +e  # 允许错误继续执行
+          if git cherry-pick $COMMIT --strategy=recursive -X theirs --allow-empty --keep-redundant-commits; then
+            echo "✅ cherry-pick成功"
+          else
+            echo "⚠️ 检测到冲突，使用源提交文件解决..."
+            
+            # 检查是否有未解决的冲突
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+            if [ -n "$CONFLICT_FILES" ]; then
+              echo "冲突文件: $CONFLICT_FILES"
+              
+              # 使用源提交的文件覆盖所有冲突文件
+              for file in $CONFLICT_FILES; do
+                echo "解决冲突: $file"
+                # 使用源提交的文件覆盖
+                git show $COMMIT:"$file" > "$file" 2>/dev/null || echo "无法恢复文件: $file"
+              done
+              
+              # 添加解决后的文件
+              git add .
             fi
-          done < "${{ needs.step2-get-commit-files.outputs.deleted_files }}"
+            
+            # 继续cherry-pick
+            git cherry-pick --continue
+            echo "✅ 冲突已解决，cherry-pick完成"
+          fi
+          set -e  # 恢复错误退出
+          
+          # 修改提交作者信息为mozi9
+          git commit --amend --author="mozi9 <mozi9>" -m "$COMMIT_MESSAGE" --allow-empty
+          
+          echo "✅ 已完成cherry-pick $I/$TOTAL"
+          I=$((I+1))
+        done
+
+    - name: Process file changes after cherry-pick
+      run: |
+        echo "处理文件变更..."
+        LATEST_COMMIT=$(git log -1 --format=%H)
+        
+        # 检出最新提交以获取所有文件
+        git checkout $LATEST_COMMIT -- .
+        
+        # 获取源提交中删除的文件列表
+        COMMITS=$(cat /tmp/commit_list.txt)
+        for COMMIT in $COMMITS; do
+          echo "处理提交 $COMMIT 的文件变更..."
+          
+          # 获取该提交中删除的文件
+          DELETED_FILES=$(git show $COMMIT --name-only --diff-filter=D --format= 2>/dev/null || true)
+          if [ -n "$DELETED_FILES" ]; then
+            echo "提交中删除的文件: $DELETED_FILES"
+            for file in $DELETED_FILES; do
+              if [ -f "$file" ] || [ -d "$file" ]; then
+                echo "删除文件: $file"
+                rm -rf "$file"
+                git add "$file"
+              else
+                echo "文件不存在，忽略删除: $file"
+              fi
+            done
+          fi
+          
+          # 获取该提交中新增/修改的文件
+          ADDED_MODIFIED_FILES=$(git show $COMMIT --name-only --diff-filter=AM --format= 2>/dev/null || true)
+          if [ -n "$ADDED_MODIFIED_FILES" ]; then
+            echo "提交中新增/修改的文件: $ADDED_MODIFIED_FILES"
+            for file in $ADDED_MODIFIED_FILES; do
+              # 从源提交恢复文件
+              if git show $COMMIT:"$file" >/dev/null 2>&1; then
+                echo "恢复文件: $file"
+                git show $COMMIT:"$file" > "$file"
+                git add "$file"
+              fi
+            done
+          fi
+        done
+        
+        # 提交所有文件变更
+        if ! git diff --cached --quiet; then
+          git commit -m "mozi9: 同步文件变更" --author="mozi9 <mozi9>"
+          echo "✅ 文件变更已提交"
+        else
+          echo "✅ 没有文件变更需要提交"
         fi
 
-    - name: 在目标仓库中检出文件
+    - name: Final cleanup and push
       run: |
-        COMMIT_HASH="${{ needs.step1-push-commit.outputs.commit_hash }}"
-        if [ -f "${{ needs.step2-get-commit-files.outputs.added_files }}" ]; then
-          while IFS= read -r file; do
-            if [ -n "$file" ]; then
-              mkdir -p "$(dirname "$file")"
-              git show $COMMIT_HASH:"$file" > "$file"
-              echo "检出: $file"
-            fi
-          done < "${{ needs.step2-get-commit-files.outputs.added_files }}"
-        fi
+        echo "最终清理和推送..."
+        
+        # 确保工作区干净
+        git reset --hard
+        git clean -fd
+        
+        # 推送到目标仓库
+        echo "推送到目标仓库..."
+        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+        
+        echo "✅ 推送完成"
 
-    - name: 提交目标仓库处理结果
+    - name: Create final summary
       run: |
-        git add -A
-        if ! git diff-index --quiet HEAD --; then
-          git commit -m "目标仓库文件处理: ${{ github.event.inputs.commit_message }}"
-          git push origin ${{ github.event.inputs.target_branch }}
-          echo "✅ 目标仓库文件处理完成"
-        fi
-
-  step4-generate-report:
-    runs-on: ubuntu-latest
-    needs: [step1-push-commit, step3-process-target-files]
-    steps:
-    - name: 生成报告
-      run: |
-        echo "# 完整工作流程报告" > $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 步骤1: 推送提交 ✅ 完成" >> $GITHUB_STEP_SUMMARY
-        echo "- 提交哈希: ${{ needs.step1-push-commit.outputs.commit_hash }}" >> $GITHUB_STEP_SUMMARY
-        echo "- 源仓库: ${{ needs.step1-push-commit.outputs.source_repo }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 步骤2: 分析文件变更 ✅ 完成" >> $GITHUB_STEP_SUMMARY
-        echo "- 新增/修改文件: $(cat ${{ needs.step2-get-commit-files.outputs.added_files }} 2>/dev/null | wc -l || echo 0)" >> $GITHUB_STEP_SUMMARY
-        echo "- 删除文件: $(cat ${{ needs.step2-get-commit-files.outputs.deleted_files }} 2>/dev/null | wc -l || echo 0)" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 步骤3: 目标仓库文件处理 ✅ 完成" >> $GITHUB_STEP_SUMMARY
-        echo "- 状态: 文件处理已完成" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 工作流程执行完成" >> $GITHUB_STEP_SUMMARY
+        echo "🎉 同步完成！"
+        echo "共同步了 ${{ steps.get_commits.outputs.commit_count }} 个提交"
+        echo "使用的身份: mozi9 <mozi9>"
+        echo "目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "目标分支: ${{ github.event.inputs.target_branch }}"
+        echo ""
+        echo "同步的提交列表："
+        cat /tmp/commit_list.txt | while read commit; do
+          git log -1 --oneline $commit
+        done
