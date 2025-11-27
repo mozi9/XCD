@@ -1,4 +1,4 @@
-name: Commit Override and Target Processing
+name: Complete Commit Override with Target Processing
 
 on:
   workflow_dispatch:
@@ -20,6 +20,9 @@ on:
         required: true
         default: "fs: Bump SuSFS version to v2.0.0"
 
+env:
+  GIT_USERNAME: "mozi9"
+
 jobs:
   step1-push-commit:
     runs-on: ubuntu-latest
@@ -33,7 +36,7 @@ jobs:
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
 
-    - name: 克隆目标仓库
+    - name: 克隆目标仓库（使用PAT）
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
@@ -50,34 +53,25 @@ jobs:
           echo "commit_hash=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
         fi
 
-    - name: 添加源仓库远程
+    - name: 添加源仓库远程（使用PAT认证）
       run: |
-        git remote add source-repo https://${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-commit.outputs.source_repo }}.git
+        git remote add source-repo https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-commit.outputs.source_repo }}.git
         git fetch source-repo ${{ steps.parse-commit.outputs.commit_hash }}
 
-    - name: 强制覆盖提交文件
+    - name: 强制覆盖提交到目标仓库
       run: |
         COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
-        
-        # 获取提交中的所有文件（去重）
-        git ls-tree -r --name-only $COMMIT_HASH | sort -u > commit_files.txt
-        
-        echo "开始覆盖文件..."
-        while IFS= read -r file; do
-          if [ -n "$file" ]; then
-            mkdir -p "$(dirname "$file")"
-            git show $COMMIT_HASH:"$file" > "$file"
-            echo "覆盖: $file"
-          fi
-        done < commit_files.txt
+        git checkout $COMMIT_HASH -- .
+        echo "✅ 提交文件已覆盖到目标仓库"
 
-    - name: 提交并推送
+    - name: 提交并推送（使用PAT认证）
       run: |
         git add -A
         git commit -m "${{ github.event.inputs.commit_message }}"
-        git push origin ${{ github.event.inputs.target_branch }}
+        git push https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+        echo "✅ 提交推送到目标仓库完成"
 
-  step2-target-processing:
+  step2-target-file-processing:
     runs-on: ubuntu-latest
     needs: step1-push-commit
     
@@ -87,7 +81,7 @@ jobs:
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
 
-    - name: 检出目标仓库（包含新提交）
+    - name: 检出目标仓库（使用PAT，包含新提交）
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
@@ -99,55 +93,90 @@ jobs:
       id: analyze-commit
       run: |
         COMMIT_HASH="${{ needs.step1-push-commit.outputs.commit_hash }}"
-        
-        # 获取父提交
-        PARENT_COMMIT=$(git log --pretty=%P -n 1 $COMMIT_HASH | head -n1 | awk '{print $1}')
+        PARENT_COMMIT=$(git log --pretty=%P -n 1 $COMMIT_HASH | awk '{print $1}')
         
         if [ -n "$PARENT_COMMIT" ]; then
-          # 获取新增和修改的文件
-          git diff --name-only --diff-filter=AM $PARENT_COMMIT $COMMIT_HASH | sort -u > files_to_add.txt
-          # 获取删除的文件
-          git diff --name-only --diff-filter=D $PARENT_COMMIT $COMMIT_HASH | sort -u > files_to_delete.txt
+          git diff --name-only --diff-filter=AM $PARENT_COMMIT $COMMIT_HASH > files_to_add.txt
+          git diff --name-only --diff-filter=D $PARENT_COMMIT $COMMIT_HASH > files_to_delete.txt
+          echo "变更统计:"
+          echo "新增/修改文件: $(wc -l < files_to_add.txt || echo 0)"
+          echo "删除文件: $(wc -l < files_to_delete.txt || echo 0)"
         else
-          # 初始提交，所有文件都是新增
-          git ls-tree -r --name-only $COMMIT_HASH | sort -u > files_to_add.txt
+          git ls-tree -r --name-only $COMMIT_HASH > files_to_add.txt
           touch files_to_delete.txt
+          echo "初始提交，所有文件为新增: $(wc -l < files_to_add.txt || echo 0)"
         fi
-        
-        echo "需要处理的文件:"
-        echo "新增/修改: $(wc -l < files_to_add.txt)"
-        echo "删除: $(wc -l < files_to_delete.txt)"
 
     - name: 在目标仓库中删除文件
+      id: delete-files
       run: |
+        deleted_count=0
         if [ -s files_to_delete.txt ]; then
-          while read -r file; do
-            if [ -f "$file" ] || [ -d "$file" ]; then
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -e "$file" ]; then
               rm -rf "$file"
+              deleted_count=$((deleted_count + 1))
               echo "删除: $file"
             fi
           done < files_to_delete.txt
         fi
+        echo "deleted_count=$deleted_count" >> $GITHUB_OUTPUT
+        echo "✅ 删除完成: $deleted_count 个文件"
 
     - name: 在目标仓库中检出文件
+      id: checkout-files
       run: |
         COMMIT_HASH="${{ needs.step1-push-commit.outputs.commit_hash }}"
-        
+        added_count=0
         if [ -s files_to_add.txt ]; then
-          while read -r file; do
-            mkdir -p "$(dirname "$file")"
-            git show $COMMIT_HASH:"$file" > "$file"
-            echo "检出: $file"
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              mkdir -p "$(dirname "$file")"
+              if git show $COMMIT_HASH:"$file" > "$file" 2>/dev/null; then
+                added_count=$((added_count + 1))
+                echo "检出: $file"
+              fi
+            fi
           done < files_to_add.txt
         fi
+        echo "added_count=$added_count" >> $GITHUB_OUTPUT
+        echo "✅ 检出完成: $added_count 个文件"
 
     - name: 提交目标仓库处理结果
+      id: commit-processing
       run: |
         git add -A
-        if ! git diff-index --quiet HEAD --; then
-          git commit -m "目标仓库文件处理: ${{ github.event.inputs.commit_message }}"
-          git push origin ${{ github.event.inputs.target_branch }}
-          echo "目标仓库处理完成"
+        if git diff-index --quiet HEAD --; then
+          echo "ℹ️ 无文件处理变更"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
         else
-          echo "无变更需要提交"
+          git commit -m "目标仓库文件处理: ${{ github.event.inputs.commit_message }}"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "✅ 目标仓库处理提交完成"
         fi
+
+    - name: 推送目标仓库处理结果（使用PAT认证）
+      if: steps.commit-processing.outputs.has_changes == 'true'
+      run: |
+        git push https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+        echo "✅ 目标仓库处理结果推送完成"
+
+    - name: 生成处理报告
+      run: |
+        cat > $GITHUB_STEP_SUMMARY << EOF
+        # 目标仓库文件处理报告
+
+        ## 认证信息
+        - 使用令牌: Mozi9_PAT
+        - 用户名: ${{ env.GIT_USERNAME }}
+        - 目标仓库: ${{ github.event.inputs.target_repo }}
+
+        ## 步骤1: 提交推送
+        - 源提交: ${{ needs.step1-push-commit.outputs.commit_hash }}
+        - 状态: ✅ 已完成
+
+        ## 步骤2: 目标仓库文件处理
+        - 删除文件: ${{ steps.delete-files.outputs.deleted_count || 0 }} 个
+        - 检出文件: ${{ steps.checkout-files.outputs.added_count || 0 }} 个
+        - 处理状态: ${{ steps.commit-processing.outputs.has_changes == 'true' && '✅ 已提交' : 'ℹ️ 无变更' }}
+        EOF
