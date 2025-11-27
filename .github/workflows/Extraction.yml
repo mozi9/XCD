@@ -1,4 +1,4 @@
-name: Simple File Sync
+name: Git-Based File Sync
 
 on:
   workflow_dispatch:
@@ -29,19 +29,19 @@ env:
   GIT_EMAIL: "mozi9@users.noreply.github.com"
 
 jobs:
-  simple-file-sync:
+  git-based-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
     - name: 🔧 安装必要工具
       run: |
         sudo apt-get update
-        sudo apt-get install -y jq curl
+        sudo apt-get install -y jq
 
     - name: 🔍 验证输入参数
       id: validate-inputs
       run: |
-        echo "=== 简单文件同步 ==="
+        echo "=== Git基础文件同步 ==="
         echo "提交链接: ${{ github.event.inputs.commit_urls }}"
         
         if [[ -z "${{ github.event.inputs.commit_urls }}" ]]; then
@@ -107,10 +107,10 @@ jobs:
         echo "commits_count=${#all_commits[@]}" >> $GITHUB_OUTPUT
         echo "✅ 解析完成: ${#all_commits[@]} 个提交"
 
-    - name: 📊 获取提交文件列表
+    - name: 📊 获取提交文件变更
       id: get-commit-files
       run: |
-        echo "=== 获取提交文件列表 ==="
+        echo "=== 获取提交文件变更 ==="
         
         readarray -t COMMITS < commit_hashes.txt
         readarray -t REPOS < repo_names.txt
@@ -124,8 +124,8 @@ jobs:
         FIRST_REPO="${REPOS[0]}"
         FIRST_COMMIT="${COMMITS[0]}"
         
-        echo "使用仓库: $FIRST_REPO"
-        echo "使用提交: $FIRST_COMMIT"
+        echo "分析仓库: $FIRST_REPO"
+        echo "分析提交: $FIRST_COMMIT"
         
         # 存储文件信息
         all_files=()
@@ -216,10 +216,10 @@ jobs:
         echo "   修改文件: ${#modified_files[@]} 个"
         echo "   删除文件: ${#deleted_files[@]} 个"
 
-    - name: 📥 直接下载文件
-      id: download-files
+    - name: 🔧 使用Git获取文件
+      id: git-get-files
       run: |
-        echo "=== 直接下载文件 ==="
+        echo "=== 使用Git获取文件 ==="
         
         readarray -t COMMITS < commit_hashes.txt
         readarray -t REPOS < repo_names.txt
@@ -233,95 +233,88 @@ jobs:
         FIRST_REPO="${REPOS[0]}"
         FIRST_COMMIT="${COMMITS[0]}"
         
-        echo "下载仓库: $FIRST_REPO"
-        echo "下载提交: $FIRST_COMMIT"
+        echo "克隆仓库: $FIRST_REPO"
+        echo "检出提交: $FIRST_COMMIT"
         
-        mkdir -p source-files
+        # 浅克隆源仓库
+        git clone --depth 1 "https://github.com/$FIRST_REPO.git" source-repo-temp
+        cd source-repo-temp
         
-        # 下载统计
-        downloaded_count=0
-        failed_count=0
+        # 检出指定提交
+        git fetch --depth 1 origin "$FIRST_COMMIT"
+        git checkout "$FIRST_COMMIT"
         
-        if [ -s all_files.txt ]; then
-          total_files=$(wc -l < all_files.txt)
-          echo "开始下载 $total_files 个文件..."
+        # 创建源文件目录
+        mkdir -p ../source-files
+        
+        # 文件统计
+        copied_count=0
+        missing_count=0
+        error_count=0
+        
+        if [ -s ../all_files.txt ]; then
+          total_files=$(wc -l < ../all_files.txt)
+          echo "开始复制 $total_files 个文件..."
           
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             
-            echo "下载: $file"
+            echo "处理: $file"
             
-            # 创建目录结构
-            mkdir -p "source-files/$(dirname "$file")"
-            
-            # 尝试多种下载方法
-            success=false
-            max_retries=2
-            
-            # 方法1: 直接下载raw文件
-            raw_url="https://raw.githubusercontent.com/$FIRST_REPO/$FIRST_COMMIT/$file"
-            echo "尝试方法1 (raw): $raw_url"
-            
-            if curl -s -f -L "$raw_url" -o "source-files/$file"; then
-              if [ -s "source-files/$file" ]; then
-                success=true
-                downloaded_count=$((downloaded_count + 1))
-                echo "✅ 方法1成功: $file"
+            if [ -f "$file" ]; then
+              # 创建目录结构
+              mkdir -p "../source-files/$(dirname "$file")"
+              
+              # 复制文件
+              if cp "$file" "../source-files/$file"; then
+                copied_count=$((copied_count + 1))
+                echo "✅ 复制成功: $file"
               else
-                echo "❌ 方法1失败: 文件为空"
-                rm -f "source-files/$file"
+                error_count=$((error_count + 1))
+                echo "❌ 复制失败: $file"
               fi
-            fi
-            
-            # 方法2: 使用GitHub API下载（如果方法1失败）
-            if [ "$success" = false ] && [ $max_retries -gt 0 ]; then
-              echo "尝试方法2 (API): $file"
-              api_url="https://api.github.com/repos/$FIRST_REPO/contents/$file?ref=$FIRST_COMMIT"
-              api_response=$(curl -s -H "Accept: application/vnd.github.v3+json" "$api_url")
+            else
+              missing_count=$((missing_count + 1))
+              echo "❌ 文件不存在: $file"
               
-              if echo "$api_response" | grep -q '"content"'; then
-                content=$(echo "$api_response" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null)
-                if [ -n "$content" ]; then
-                  echo "$content" > "source-files/$file"
-                  if [ -s "source-files/$file" ]; then
-                    success=true
-                    downloaded_count=$((downloaded_count + 1))
-                    echo "✅ 方法2成功: $file"
+              # 检查文件是否在Git历史中
+              if git cat-file -e "$FIRST_COMMIT:$file" 2>/dev/null; then
+                echo "✅ 文件在Git历史中存在，尝试提取..."
+                
+                # 尝试从Git历史中提取文件
+                if git show "$FIRST_COMMIT:$file" > "../source-files/$file" 2>/dev/null; then
+                  if [ -s "../source-files/$file" ]; then
+                    copied_count=$((copied_count + 1))
+                    echo "✅ Git提取成功: $file"
+                  else
+                    echo "❌ Git提取失败: 文件为空"
+                    rm -f "../source-files/$file"
                   fi
+                else
+                  echo "❌ Git提取失败: 无法获取文件内容"
                 fi
+              else
+                echo "❌ 文件在Git历史中也不存在"
               fi
             fi
-            
-            if [ "$success" = false ]; then
-              failed_count=$((failed_count + 1))
-              echo "❌ 所有方法失败: $file"
-              
-              # 检查文件是否存在
-              check_url="https://api.github.com/repos/$FIRST_REPO/contents/$file?ref=$FIRST_COMMIT"
-              http_code=$(curl -s -o /dev/null -w "%{http_code}" -L "$check_url")
-              echo "文件存在性检查: HTTP $http_code"
-              
-              # 记录失败的文件
-              echo "$file|$http_code" >> failed_downloads.txt
-            fi
-            
-            # 短暂延迟避免限流
-            sleep 0.1
-            
-          done < all_files.txt
+          done < ../all_files.txt
         fi
         
-        echo "downloaded_count=$downloaded_count" >> $GITHUB_OUTPUT
-        echo "failed_count=$failed_count" >> $GITHUB_OUTPUT
+        cd ..
         
-        echo "✅ 下载完成:"
-        echo "   成功下载: $downloaded_count 个文件"
-        echo "   下载失败: $failed_count 个文件"
+        echo "copied_count=$copied_count" >> $GITHUB_OUTPUT
+        echo "missing_count=$missing_count" >> $GITHUB_OUTPUT
+        echo "error_count=$error_count" >> $GITHUB_OUTPUT
+        
+        echo "✅ 文件获取完成:"
+        echo "   成功复制: $copied_count 个文件"
+        echo "   缺失文件: $missing_count 个"
+        echo "   错误操作: $error_count 个"
 
-    - name: 🔄 同步文件
+    - name: 🔄 同步文件到目标仓库
       id: sync-files
       run: |
-        echo "=== 同步文件 ==="
+        echo "=== 同步文件到目标仓库 ==="
         
         # 操作统计
         added_count=0
@@ -457,16 +450,16 @@ jobs:
         git push origin "${{ github.event.inputs.target_branch }}"
         echo "✅ 推送成功"
 
-    - name: 📋 生成报告
+    - name: 📋 生成详细报告
       if: always()
       run: |
         cat > "$GITHUB_STEP_SUMMARY" << EOF
-        # 简单文件同步报告
+        # Git基础文件同步报告
         
         ## 总体统计
         - **分析提交**: ${{ steps.parse-commit-urls.outputs.commits_count }} 个
         - **提交中文件**: ${{ steps.get-commit-files.outputs.all_files_count }} 个
-        - **下载结果**: ${{ steps.download-files.outputs.downloaded_count }} 成功, ${{ steps.download-files.outputs.failed_count }} 失败
+        - **Git获取结果**: ${{ steps.git-get-files.outputs.copied_count }} 成功, ${{ steps.git-get-files.outputs.missing_count }} 缺失
         - **文件操作**: ${{ steps.sync-files.outputs.added_count }} 新增, ${{ steps.sync-files.outputs.modified_count }} 修改, ${{ steps.sync-files.outputs.deleted_count }} 删除
         - **最终提交**: ${{ steps.commit-changes.outputs.changed_files_count || '0' }} 个文件
         - **操作状态**: ${{ steps.commit-changes.outputs.has_changes == 'true' && '✅ 成功提交' || 'ℹ️ 无变更' }}
@@ -474,30 +467,30 @@ jobs:
         ## 详细操作记录
         EOF
         
-        # 显示下载失败的文件
-        if [ -f failed_downloads.txt ] && [ -s failed_downloads.txt ]; then
-          echo "### ❌ 下载失败的文件 (${{ steps.download-files.outputs.failed_count }} 个)" >> "$GITHUB_STEP_SUMMARY"
-          while IFS= read -r line; do
-            file=$(echo "$line" | cut -d'|' -f1)
-            http_code=$(echo "$line" | cut -d'|' -f2)
-            echo "- \`$file\` (HTTP $http_code)" >> "$GITHUB_STEP_SUMMARY"
-          done < failed_downloads.txt
+        # 显示缺失的文件
+        if [ -f all_files.txt ]; then
+          echo "### ❌ 缺失的文件 (${{ steps.git-get-files.outputs.missing_count }} 个)" >> "$GITHUB_STEP_SUMMARY"
+          echo "这些文件在提交中被列出，但在仓库中不存在:" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r file; do
+            if [ ! -f "source-files/$file" ] || [ ! -s "source-files/$file" ]; then
+              echo "- \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < all_files.txt
           echo "" >> "$GITHUB_STEP_SUMMARY"
         fi
         
         cat >> "$GITHUB_STEP_SUMMARY" << EOF
         ## 问题诊断
-        - **HTTP 404错误**: 文件在指定提交中不存在
-        - **可能原因**: 文件在后续提交中被删除，或提交哈希不正确
-        - **解决方案**: 检查提交哈希是否正确，或使用其他提交
+        - **缺失文件**: 这些文件在提交中被列出，但在仓库中不存在
+        - **可能原因**: 文件在后续提交中被删除，或提交信息有误
+        - **解决方案**: 使用Git命令直接从历史中提取文件
         
-        **执行时间**: 预计1-2分钟
+        **执行时间**: 预计3-5分钟
         EOF
 
     - name: 🧹 清理临时文件
       if: always()
       run: |
-        rm -rf source-files
+        rm -rf source-repo-temp source-files
         rm -f commit_hashes.txt repo_names.txt all_files.txt
-        rm -f added_files.txt modified_files.txt deleted_files.txt
-        rm -f failed_downloads.txt 2>/dev/null || true
+        rm -f added_files.txt modified_files.txt deleted_files.txt 2>/dev/null || true
