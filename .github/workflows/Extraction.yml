@@ -1,4 +1,4 @@
-name: Complete Commit Sync
+name: Simple Commit File Sync
 
 on:
   workflow_dispatch:
@@ -20,51 +20,15 @@ on:
         required: true
         default: "fs: Bump SuSFS version to v2.0.0"
 
+env:
+  GIT_USERNAME: "mozi9"
+
 jobs:
-  push-commit:
+  step1-push-commit-files:
     runs-on: ubuntu-latest
-    steps:
-    - name: 配置Git
-      run: |
-        git config --global user.name "mozi9"
-        git config --global user.email "mozi9@users.noreply.github.com"
-
-    - name: 克隆目标仓库
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ github.event.inputs.target_repo }}
-        ref: ${{ github.event.inputs.target_branch }}
-        token: ${{ secrets.Mozi9_PAT }}
-        fetch-depth: 0
-
-    - name: 解析提交链接
-      id: parse-commit
-      run: |
-        COMMIT_URL="${{ github.event.inputs.source_commit_url }}"
-        if [[ "$COMMIT_URL" =~ github.com/([^/]+)/([^/]+)/commit/([a-f0-9]+) ]]; then
-          echo "source_repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
-          echo "commit_hash=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
-        fi
-
-    - name: 添加源仓库远程
-      run: |
-        git remote add source-repo https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-commit.outputs.source_repo }}.git
-        git fetch source-repo ${{ steps.parse-commit.outputs.commit_hash }}
-
-    - name: 强制覆盖文件
-      run: |
-        COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
-        git checkout $COMMIT_HASH -- .
-
-    - name: 提交并推送
-      run: |
-        git add -A
-        git commit -m "${{ github.event.inputs.commit_message }}"
-        git push origin ${{ github.event.inputs.target_branch }}
-
-  process-files:
-    runs-on: ubuntu-latest
-    needs: push-commit
+    outputs:
+      commit_hash: ${{ steps.parse-commit.outputs.commit_hash }}
+      file_count: ${{ steps.get-files.outputs.file_count }}
     
     steps:
     - name: 配置Git
@@ -72,7 +36,70 @@ jobs:
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
 
-    - name: 检出目标仓库
+    - name: 克隆目标仓库（使用令牌）
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        ref: ${{ github.event.inputs.target_branch }}
+        token: ${{ secrets.Mozi9_PAT }}
+
+    - name: 解析提交链接
+      id: parse-commit
+      run: |
+        COMMIT_URL="${{ github.event.inputs.source_commit_url }}"
+        if [[ "$COMMIT_URL" =~ github.com/([^/]+)/([^/]+)/commit/([a-f0-9]+) ]]; then
+          echo "commit_hash=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
+          echo "source_repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: 获取提交中的文件列表（使用令牌认证）
+      id: get-files
+      run: |
+        COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
+        SOURCE_REPO="${{ steps.parse-commit.outputs.source_repo }}"
+        
+        # 使用API获取文件列表（带令牌认证）
+        curl -s -H "Authorization: token ${{ secrets.Mozi9_PAT }}" \
+          "https://api.github.com/repos/$SOURCE_REPO/git/trees/$COMMIT_HASH?recursive=1" | \
+          jq -r '.tree[] | select(.type == "blob") | .path' | sort -u > file_list.txt
+        
+        echo "文件数量: $(wc -l < file_list.txt)"
+        echo "file_count=$(wc -l < file_list.txt)" >> $GITHUB_OUTPUT
+
+    - name: 下载并覆盖文件（使用令牌认证）
+      run: |
+        COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
+        SOURCE_REPO="${{ steps.parse-commit.outputs.source_repo }}"
+        
+        # 下载每个文件（带令牌认证）
+        while IFS= read -r file; do
+          if [ -n "$file" ]; then
+            mkdir -p "$(dirname "$file")"
+            # 使用令牌认证下载文件
+            curl -s -H "Authorization: token ${{ secrets.Mozi9_PAT }}" \
+              "https://raw.githubusercontent.com/$SOURCE_REPO/$COMMIT_HASH/$file" -o "$file"
+            echo "下载: $file"
+          fi
+        done < file_list.txt
+
+    - name: 提交并推送（使用令牌认证）
+      run: |
+        git add -A
+        git commit -m "${{ github.event.inputs.commit_message }}"
+        git push https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+        echo "✅ 提交推送完成"
+
+  step2-process-files-in-target:
+    runs-on: ubuntu-latest
+    needs: step1-push-commit-files
+    
+    steps:
+    - name: 配置Git
+      run: |
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9@users.noreply.github.com"
+
+    - name: 检出目标仓库（使用令牌）
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
@@ -82,20 +109,25 @@ jobs:
 
     - name: 分析文件变更
       run: |
-        COMMIT_HASH="${{ needs.push-commit.outputs.commit_hash }}"
+        COMMIT_HASH="${{ needs.step1-push-commit-files.outputs.commit_hash }}"
+        
+        # 获取父提交
         PARENT_COMMIT=$(git log --pretty=%P -n 1 $COMMIT_HASH | awk '{print $1}')
         
         if [ -n "$PARENT_COMMIT" ]; then
+          # 新增和修改的文件
           git diff --name-only --diff-filter=AM $PARENT_COMMIT $COMMIT_HASH > files_to_add.txt
+          # 删除的文件
           git diff --name-only --diff-filter=D $PARENT_COMMIT $COMMIT_HASH > files_to_delete.txt
         else
+          # 初始提交，所有文件都是新增
           git ls-tree -r --name-only $COMMIT_HASH > files_to_add.txt
           touch files_to_delete.txt
         fi
 
-    - name: 删除文件
+    - name: 删除目标仓库中的文件
       run: |
-        if [ -f files_to_delete.txt ]; then
+        if [ -s files_to_delete.txt ]; then
           while IFS= read -r file; do
             if [ -n "$file" ] && [ -f "$file" ]; then
               rm -f "$file"
@@ -104,10 +136,11 @@ jobs:
           done < files_to_delete.txt
         fi
 
-    - name: 检出文件
+    - name: 检出文件到目标仓库
       run: |
-        COMMIT_HASH="${{ needs.push-commit.outputs.commit_hash }}"
-        if [ -f files_to_add.txt ]; then
+        COMMIT_HASH="${{ needs.step1-push-commit-files.outputs.commit_hash }}"
+        
+        if [ -s files_to_add.txt ]; then
           while IFS= read -r file; do
             if [ -n "$file" ]; then
               mkdir -p "$(dirname "$file")"
@@ -117,10 +150,11 @@ jobs:
           done < files_to_add.txt
         fi
 
-    - name: 提交处理结果
+    - name: 提交处理结果（使用令牌认证）
       run: |
         git add -A
         if ! git diff-index --quiet HEAD --; then
           git commit -m "文件处理: ${{ github.event.inputs.commit_message }}"
-          git push origin ${{ github.event.inputs.target_branch }}
+          git push https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+          echo "✅ 文件处理结果推送完成"
         fi
