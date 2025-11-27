@@ -19,13 +19,14 @@ on:
         description: '目标分支名'
         required: true
         default: 'main'
-      start_commit:
-        description: '开始同步的提交哈希 (完整哈希)'
-        required: false
+      commit_hashes:
+        description: '要同步的提交哈希（多个用逗号分隔）'
+        required: true
+        default: '75fef37dde7c3cbcde63ae7542f115fb04d9ee70,fa957cbe93c6260f4968cf3d01ec3974bcd49ff8,5a3d762db366d870e8959c143dc7037c51450675'
       max_commits:
         description: '最大同步提交数量'
         required: true
-        default: '10'
+        default: '50'
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,58 +53,73 @@ jobs:
         git config --global user.name "mozi9"
         git config --global user.email "mozi9"
 
-    - name: Get commit list to sync
-      id: get_commits
+    - name: Parse and validate commit hashes
+      id: parse_commits
       run: |
-        # 获取完整提交哈希列表
-        if [ -n "${{ github.event.inputs.start_commit }}" ]; then
-          # 验证start_commit是否存在
-          if ! git rev-parse ${{ github.event.inputs.start_commit }} >/dev/null 2>&1; then
-            echo "错误: 提交 ${{ github.event.inputs.start_commit }} 不存在"
+          # 清理输入，移除空格和换行
+          CLEAN_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' '\n' | grep -v '^$')
+          
+          # 验证每个提交哈希是否存在
+          VALID_COMMITS=""
+          INVALID_COMMITS=""
+          COMMIT_COUNT=0
+          
+          for hash in $CLEAN_HASHES; do
+            if git rev-parse $hash >/dev/null 2>&1; then
+              VALID_COMMITS="$VALID_COMMITS$hash"$'\n'
+              COMMIT_COUNT=$((COMMIT_COUNT + 1))
+              echo "✅ 提交有效: $hash - $(git log -1 --format="%s" $hash 2>/dev/null || echo '无法获取提交信息')"
+            else
+              INVALID_COMMITS="$INVALID_COMMITS$hash"$'\n'
+              echo "❌ 提交无效: $hash"
+            fi
+          done
+          
+          if [ $COMMIT_COUNT -eq 0 ]; then
+            echo "错误: 没有找到有效的提交哈希"
             exit 1
           fi
-          # 从指定提交开始，获取之后的提交
-          COMMITS=$(git log --reverse --format=%H ${{ github.event.inputs.start_commit }}..source-repo/${{ github.event.inputs.source_branch }} | head -n ${{ github.event.inputs.max_commits }})
-        else
-          # 从最新提交开始，获取指定数量的提交
-          COMMITS=$(git log --reverse --format=%H -n ${{ github.event.inputs.max_commits }} source-repo/${{ github.event.inputs.source_branch }})
-        fi
-        
-        # 计算提交数量
-        if [ -z "$COMMITS" ]; then
-          COMMIT_COUNT=0
-        else
-          COMMIT_COUNT=$(echo "$COMMITS" | wc -l)
-        fi
-        
-        if [ "$COMMIT_COUNT" -eq 0 ]; then
-          echo "没有找到需要同步的提交"
-          exit 1
-        fi
-        
-        echo "找到 $COMMIT_COUNT 个需要同步的提交"
-        echo "提交列表:"
-        echo "$COMMITS" | while read commit; do
-          git log -1 --oneline $commit
-        done
-        
-        # 保存完整哈希列表到文件
-        echo "$COMMITS" > /tmp/commit_list.txt
-        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          
+          # 限制提交数量
+          MAX_COMMITS=${{ github.event.inputs.max_commits }}
+          if [ $COMMIT_COUNT -gt $MAX_COMMITS ]; then
+            echo "警告: 提交数量 $COMMIT_COUNT 超过最大限制 $MAX_COMMITS，将只处理前 $MAX_COMMITS 个提交"
+            VALID_COMMITS=$(echo "$VALID_COMMITS" | head -n $MAX_COMMITS)
+            COMMIT_COUNT=$MAX_COMMITS
+          fi
+          
+          # 保存有效提交到文件
+          echo "$VALID_COMMITS" > /tmp/valid_commits.txt
+          echo "找到 $COMMIT_COUNT 个有效提交"
+          
+          # 输出无效提交（如果有）
+          if [ -n "$INVALID_COMMITS" ]; then
+            echo "无效的提交哈希:"
+            echo "$INVALID_COMMITS"
+          fi
+          
+          echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
 
     - name: Cherry-pick commits with Mozi9 identity
       run: |
-        COMMITS=$(cat /tmp/commit_list.txt)
+        COMMITS=$(cat /tmp/valid_commits.txt)
         I=1
-        TOTAL=${{ steps.get_commits.outputs.commit_count }}
+        TOTAL=${{ steps.parse_commits.outputs.commit_count }}
         
         for COMMIT in $COMMITS; do
           echo "================================================================="
           echo "正在cherry-pick提交 $I/$TOTAL: $COMMIT"
           
           # 获取提交信息（只保留提交消息）
-          COMMIT_MESSAGE=$(git log -1 --format=%s $COMMIT)
+          COMMIT_MESSAGE=$(git log -1 --format=%s $COMMIT 2>/dev/null || echo "mozi9: 同步提交")
           echo "提交信息: $COMMIT_MESSAGE"
+          
+          # 检查是否已经cherry-pick过
+          if git log --oneline | grep -q "$COMMIT"; then
+            echo "⚠️ 提交已存在，跳过"
+            I=$((I+1))
+            continue
+          fi
           
           # 尝试cherry-pick，冲突时直接使用源提交的文件
           set +e  # 允许错误继续执行
@@ -113,7 +129,7 @@ jobs:
             echo "⚠️ 检测到冲突，使用源提交文件解决..."
             
             # 检查是否有未解决的冲突
-            CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
             if [ -n "$CONFLICT_FILES" ]; then
               echo "冲突文件: $CONFLICT_FILES"
               
@@ -141,50 +157,49 @@ jobs:
           I=$((I+1))
         done
 
-    - name: Process file changes after cherry-pick
+    - name: Process file changes
       run: |
         echo "处理文件变更..."
-        LATEST_COMMIT=$(git log -1 --format=%H)
+        COMMITS=$(cat /tmp/valid_commits.txt)
         
-        # 检出最新提交以获取所有文件
-        git checkout $LATEST_COMMIT -- .
-        
-        # 获取源提交中删除的文件列表
-        COMMITS=$(cat /tmp/commit_list.txt)
+        # 处理每个提交的文件变更
         for COMMIT in $COMMITS; do
           echo "处理提交 $COMMIT 的文件变更..."
           
           # 获取该提交中删除的文件
           DELETED_FILES=$(git show $COMMIT --name-only --diff-filter=D --format= 2>/dev/null || true)
           if [ -n "$DELETED_FILES" ]; then
-            echo "提交中删除的文件: $DELETED_FILES"
+            echo "提交中删除的文件:"
+            echo "$DELETED_FILES"
             for file in $DELETED_FILES; do
               if [ -f "$file" ] || [ -d "$file" ]; then
                 echo "删除文件: $file"
                 rm -rf "$file"
-                git add "$file"
+                git add "$file" 2>/dev/null || true
               else
                 echo "文件不存在，忽略删除: $file"
               fi
             done
           fi
           
-          # 获取该提交中新增/修改的文件
+          # 获取该提交中新增/修改的文件并确保存在
           ADDED_MODIFIED_FILES=$(git show $COMMIT --name-only --diff-filter=AM --format= 2>/dev/null || true)
           if [ -n "$ADDED_MODIFIED_FILES" ]; then
-            echo "提交中新增/修改的文件: $ADDED_MODIFIED_FILES"
+            echo "提交中新增/修改的文件:"
+            echo "$ADDED_MODIFIED_FILES"
             for file in $ADDED_MODIFIED_FILES; do
               # 从源提交恢复文件
               if git show $COMMIT:"$file" >/dev/null 2>&1; then
-                echo "恢复文件: $file"
-                git show $COMMIT:"$file" > "$file"
-                git add "$file"
+                echo "确保文件存在: $file"
+                mkdir -p "$(dirname "$file")"
+                git show $COMMIT:"$file" > "$file" 2>/dev/null || echo "无法恢复文件: $file"
+                git add "$file" 2>/dev/null || true
               fi
             done
           fi
         done
         
-        # 提交所有文件变更
+        # 提交所有文件变更（如果有变化）
         if ! git diff --cached --quiet; then
           git commit -m "mozi9: 同步文件变更" --author="mozi9 <mozi9>"
           echo "✅ 文件变更已提交"
@@ -192,29 +207,23 @@ jobs:
           echo "✅ 没有文件变更需要提交"
         fi
 
-    - name: Final cleanup and push
+    - name: Final push to target repository
       run: |
-        echo "最终清理和推送..."
-        
-        # 确保工作区干净
-        git reset --hard
-        git clean -fd
-        
-        # 推送到目标仓库
         echo "推送到目标仓库..."
         git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
-        
         echo "✅ 推送完成"
 
     - name: Create final summary
       run: |
         echo "🎉 同步完成！"
-        echo "共同步了 ${{ steps.get_commits.outputs.commit_count }} 个提交"
+        echo "共同步了 ${{ steps.parse_commits.outputs.commit_count }} 个提交"
         echo "使用的身份: mozi9 <mozi9>"
         echo "目标仓库: ${{ github.event.inputs.target_repo }}"
         echo "目标分支: ${{ github.event.inputs.target_branch }}"
         echo ""
         echo "同步的提交列表："
-        cat /tmp/commit_list.txt | while read commit; do
-          git log -1 --oneline $commit
+        cat /tmp/valid_commits.txt | while read commit; do
+          if [ -n "$commit" ]; then
+            git log -1 --oneline $commit 2>/dev/null || echo "$commit - 已同步"
+          fi
         done
