@@ -36,7 +36,7 @@ jobs:
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
 
-    - name: 克隆目标仓库（使用PAT）
+    - name: 克隆目标仓库
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
@@ -53,7 +53,7 @@ jobs:
           echo "commit_hash=${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
         fi
 
-    - name: 添加源仓库远程（使用PAT认证）
+    - name: 添加源仓库远程
       run: |
         git remote add source-repo https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-commit.outputs.source_repo }}.git
         git fetch source-repo ${{ steps.parse-commit.outputs.commit_hash }}
@@ -62,14 +62,14 @@ jobs:
       run: |
         COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
         git checkout $COMMIT_HASH -- .
-        echo "✅ 提交文件已覆盖到目标仓库"
+        echo "提交文件已覆盖到目标仓库"
 
-    - name: 提交并推送（使用PAT认证）
+    - name: 提交并推送
       run: |
         git add -A
         git commit -m "${{ github.event.inputs.commit_message }}"
         git push https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
-        echo "✅ 提交推送到目标仓库完成"
+        echo "提交推送到目标仓库完成"
 
   step2-target-file-processing:
     runs-on: ubuntu-latest
@@ -81,7 +81,7 @@ jobs:
         git config --global user.name "mozi9"
         git config --global user.email "mozi9@users.noreply.github.com"
 
-    - name: 检出目标仓库（使用PAT，包含新提交）
+    - name: 检出目标仓库
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
@@ -121,7 +121,7 @@ jobs:
           done < files_to_delete.txt
         fi
         echo "deleted_count=$deleted_count" >> $GITHUB_OUTPUT
-        echo "✅ 删除完成: $deleted_count 个文件"
+        echo "删除完成: $deleted_count 个文件"
 
     - name: 在目标仓库中检出文件
       id: checkout-files
@@ -140,43 +140,41 @@ jobs:
           done < files_to_add.txt
         fi
         echo "added_count=$added_count" >> $GITHUB_OUTPUT
-        echo "✅ 检出完成: $added_count 个文件"
+        echo "检出完成: $added_count 个文件"
 
     - name: 提交目标仓库处理结果
       id: commit-processing
       run: |
         git add -A
         if git diff-index --quiet HEAD --; then
-          echo "ℹ️ 无文件处理变更"
+          echo "无文件处理变更"
           echo "has_changes=false" >> $GITHUB_OUTPUT
         else
           git commit -m "目标仓库文件处理: ${{ github.event.inputs.commit_message }}"
           echo "has_changes=true" >> $GITHUB_OUTPUT
-          echo "✅ 目标仓库处理提交完成"
+          echo "目标仓库处理提交完成"
         fi
 
-    - name: 推送目标仓库处理结果（使用PAT认证）
+    - name: 推送目标仓库处理结果
       if: steps.commit-processing.outputs.has_changes == 'true'
       run: |
         git push https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
-        echo "✅ 目标仓库处理结果推送完成"
+        echo "目标仓库处理结果推送完成"
 
     - name: 生成处理报告
       run: |
-        cat > $GITHUB_STEP_SUMMARY << EOF
-        # 目标仓库文件处理报告
-
-        ## 认证信息
-        - 使用令牌: Mozi9_PAT
-        - 用户名: ${{ env.GIT_USERNAME }}
-        - 目标仓库: ${{ github.event.inputs.target_repo }}
-
-        ## 步骤1: 提交推送
-        - 源提交: ${{ needs.step1-push-commit.outputs.commit_hash }}
-        - 状态: ✅ 已完成
-
-        ## 步骤2: 目标仓库文件处理
-        - 删除文件: ${{ steps.delete-files.outputs.deleted_count || 0 }} 个
-        - 检出文件: ${{ steps.checkout-files.outputs.added_count || 0 }} 个
-        - 处理状态: ${{ steps.commit-processing.outputs.has_changes == 'true' && '✅ 已提交' : 'ℹ️ 无变更' }}
-        EOF
+        echo "# 目标仓库文件处理报告" > $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 认证信息" >> $GITHUB_STEP_SUMMARY
+        echo "- 使用令牌: Mozi9_PAT" >> $GITHUB_STEP_SUMMARY
+        echo "- 用户名: ${{ env.GIT_USERNAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- 目标仓库: ${{ github.event.inputs.target_repo }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 步骤1: 提交推送" >> $GITHUB_STEP_SUMMARY
+        echo "- 源提交: ${{ needs.step1-push-commit.outputs.commit_hash }}" >> $GITHUB_STEP_SUMMARY
+        echo "- 状态: 已完成" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 步骤2: 目标仓库文件处理" >> $GITHUB_STEP_SUMMARY
+        echo "- 删除文件: ${{ steps.delete-files.outputs.deleted_count || 0 }} 个" >> $GITHUB_STEP_SUMMARY
+        echo "- 检出文件: ${{ steps.checkout-files.outputs.added_count || 0 }} 个" >> $GITHUB_STEP_SUMMARY
+        echo "- 处理状态: ${{ steps.commit-processing.outputs.has_changes == 'true' && '已提交' : '无变更' }}" >> $GITHUB_STEP_SUMMARY
