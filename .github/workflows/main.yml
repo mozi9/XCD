@@ -1,211 +1,191 @@
-name: Cross Repository Sync
+name: 🔄 Cross-Repository Sync
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库链接 (格式: owner/repo)'
+        description: '源仓库地址 (https://github.com/owner/repo)'
         required: true
+        default: 'https://github.com/example/source-repo'
         type: string
-        default: 'mozi9/MIUI'
       source_branch:
-        description: '源分支名称 (留空使用默认分支)'
-        required: false
+        description: '源仓库分支'
+        required: true
+        default: 'main'
         type: string
-        default: ''
       target_repo:
-        description: '目标仓库链接 (格式: owner/repo)'
+        description: '目标仓库地址 (https://github.com/owner/repo)'
         required: true
+        default: 'https://github.com/example/target-repo'
         type: string
-        default: ''
       target_branch:
-        description: '目标分支名称 (新建分支)'
+        description: '目标仓库新分支名称'
         required: true
+        default: 'sync-from-source-'
         type: string
-        default: 'sync-from-source'
-      pat_token:
-        description: 'PAT令牌 (需要有目标仓库写入权限)'
-        required: true
-        type: string
-        default: ''
+      create_pr:
+        description: '是否自动创建Pull Request'
+        required: false
+        default: true
+        type: boolean
 
 env:
-  # 使用提供的 PAT 令牌
-  CUSTOM_PAT: ${{ github.event.inputs.pat_token }}
+  PAT_TOKEN: ${{ secrets.Mozi9_PAT }}
+  USER_NAME: 'mozi9'
+  USER_EMAIL: 'mozi9'
 
 jobs:
-  cross-repo-sync:
-    name: Sync ${{ github.event.inputs.source_repo }} → ${{ github.event.inputs.target_repo }}
+  sync-repositories:
+    name: 🔄 同步仓库代码
     runs-on: ubuntu-latest
     
     steps:
-    - name: Validate inputs
-      id: validate
+    - name: 🚀 开始同步流程
       run: |
-        if [ -z "${{ github.event.inputs.target_repo }}" ]; then
-          echo "❌ 目标仓库不能为空"
-          exit 1
-        fi
-        
-        if [ -z "${{ env.CUSTOM_PAT }}" ]; then
-          echo "❌ PAT令牌不能为空"
-          exit 1
-        fi
-        
-        echo "✅ 输入验证通过"
-
-    - name: Get source repository info
-      id: source_info
-      run: |
-        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
-        
-        # 自动检测源仓库默认分支
-        if [ -z "${{ github.event.inputs.source_branch }}" ]; then
-          echo "🔍 检测源仓库默认分支..."
-          DEFAULT_BRANCH=$(curl -s \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$SOURCE_REPO" | \
-            jq -r '.default_branch // "main"')
-          
-          if [ "$DEFAULT_BRANCH" = "null" ] || [ -z "$DEFAULT_BRANCH" ]; then
-            DEFAULT_BRANCH="main"
-          fi
-          
-          echo "source_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
-          echo "📦 使用默认分支: $DEFAULT_BRANCH"
-        else
-          echo "source_branch=${{ github.event.inputs.source_branch }}" >> $GITHUB_OUTPUT
-          echo "📦 使用指定分支: ${{ github.event.inputs.source_branch }}"
-        fi
-
-    - name: Clone source repository
-      run: |
-        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
-        SOURCE_BRANCH="${{ steps.source_info.outputs.source_branch }}"
-        
-        echo "⬇️ 克隆源仓库: $SOURCE_REPO:$SOURCE_BRANCH"
-        git clone \
-          --branch "$SOURCE_BRANCH" \
-          --depth 1 \
-          "https://github.com/$SOURCE_REPO.git" \
-          source-repo
-        
-        cd source-repo
-        echo "📊 源仓库信息:"
-        git log -1 --oneline
-        ls -la
-
-    - name: Clone target repository
-      run: |
-        TARGET_REPO="${{ github.event.inputs.target_repo }}"
-        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-        
-        echo "⬇️ 克隆目标仓库: $TARGET_REPO"
-        git clone \
-          --depth 1 \
-          "https://${{ env.CUSTOM_PAT }}@github.com/$TARGET_REPO.git" \
-          target-repo
-        
-        cd target-repo
-        
-        # 检查目标分支是否存在
-        if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
-          echo "🔄 目标分支已存在，切换到: $TARGET_BRANCH"
-          git checkout "$TARGET_BRANCH"
-        else
-          echo "🆕 创建新目标分支: $TARGET_BRANCH"
-          git checkout -b "$TARGET_BRANCH"
-        fi
-
-    - name: Sync files from source to target
-      run: |
-        echo "🔄 同步文件..."
-        
-        # 删除目标仓库现有文件（保留 .git 目录）
-        cd target-repo
-        find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
-        
-        # 复制源仓库文件到目标仓库
-        cd ..
-        cp -r source-repo/* target-repo/
-        cp source-repo/.* target-repo/ 2>/dev/null || true
-        
-        # 显示同步结果
-        cd target-repo
-        echo "📁 同步后的文件列表:"
-        ls -la
-        echo "📊 文件数量: $(find . -type f | wc -l)"
-
-    - name: Configure Git for target repository
-      run: |
-        cd target-repo
-        
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        
-        # 添加所有更改
-        git add .
-        
-        # 检查是否有更改
-        if git diff --cached --quiet; then
-          echo "ℹ️ 没有检测到文件更改"
-          echo "has_changes=false" >> $GITHUB_OUTPUT
-        else
-          echo "✅ 检测到文件更改，准备提交"
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Commit and push changes
-      if: steps.config.outputs.has_changes == 'true'
-      run: |
-        cd target-repo
-        
-        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
-        SOURCE_BRANCH="${{ steps.source_info.outputs.source_branch }}"
-        
-        COMMIT_MSG="Sync from $SOURCE_REPO:$SOURCE_BRANCH - $(date +'%Y-%m-%d %H:%M:%S')"
-        
-        echo "💾 提交更改: $COMMIT_MSG"
-        git commit -m "$COMMIT_MSG"
-        
-        echo "🚀 推送到目标仓库..."
-        git push origin "$TARGET_BRANCH" --force-with-lease
-        
-        echo "✅ 推送完成"
-
-    - name: Create summary
-      run: |
-        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
-        SOURCE_BRANCH="${{ steps.source_info.outputs.source_branch }}"
-        TARGET_REPO="${{ github.event.inputs.target_repo }}"
-        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-        
-        echo "🎉 同步完成摘要" >> $GITHUB_STEP_SUMMARY
-        echo "====" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**源仓库:** $SOURCE_REPO" >> $GITHUB_STEP_SUMMARY
-        echo "**源分支:** $SOURCE_BRANCH" >> $GITHUB_STEP_SUMMARY
-        echo "**目标仓库:** $TARGET_REPO" >> $GITHUB_STEP_SUMMARY
-        echo "**目标分支:** $TARGET_BRANCH" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "🔗 **分支链接:** https://github.com/$TARGET_REPO/tree/$TARGET_BRANCH" >> $GITHUB_STEP_SUMMARY
-        
-        if [ "${{ steps.config.outputs.has_changes }}" = "true" ]; then
-          echo "✅ **状态:** 同步成功，已创建新分支" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "ℹ️ **状态:** 没有检测到文件更改" >> $GITHUB_STEP_SUMMARY
-        fi
-
-    - name: Show sync result
-      run: |
-        echo "=========================================="
-        echo "🎯 同步结果"
-        echo "=========================================="
+        echo "开始跨仓库同步..."
         echo "源仓库: ${{ github.event.inputs.source_repo }}"
-        echo "源分支: ${{ steps.source_info.outputs.source_branch }}"
+        echo "源分支: ${{ github.event.inputs.source_branch }}"
         echo "目标仓库: ${{ github.event.inputs.target_repo }}"
-        echo "目标分支: ${{ github.event.inputs.target_branch }}"
+        echo "目标分支: ${{ github.event.inputs.target_branch }}$(date +%Y%m%d%H%M%S)"
+
+    - name: ⚙️ 配置Git身份信息
+      run: |
+        git config --global user.name "${{ env.USER_NAME }}"
+        git config --global user.email "${{ env.USER_EMAIL }}"
+        git config --global pull.rebase false
+
+    - name: 📥 克隆源仓库
+      run: |
+        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
+        if [[ $SOURCE_REPO == https://github.com/* ]]; then
+          REPO_PATH=$(echo $SOURCE_REPO | sed 's|https://github.com/||')
+          CLONE_URL="https://${{ env.USER_NAME }}:${{ env.PAT_TOKEN }}@github.com/$REPO_PATH"
+        else
+          CLONE_URL="$SOURCE_REPO"
+        fi
+        echo "克隆源仓库: $CLONE_URL"
+        git clone --depth 1 --branch "${{ github.event.inputs.source_branch }}" "$CLONE_URL" source-repo
+        cd source-repo
+        git fetch --depth 1 origin "${{ github.event.inputs.source_branch }}"
+
+    - name: 🔧 配置目标仓库远程地址
+      run: |
+        TARGET_REPO="${{ github.event.inputs.target_repo }}"
+        if [[ $TARGET_REPO == https://github.com/* ]]; then
+          REPO_PATH=$(echo $TARGET_REPO | sed 's|https://github.com/||')
+          TARGET_URL="https://${{ env.USER_NAME }}:${{ env.PAT_TOKEN }}@github.com/$REPO_PATH"
+        else
+          TARGET_URL="$TARGET_REPO"
+        fi
+        echo "目标仓库URL: $TARGET_URL"
+        echo "TARGET_CLONE_URL=$TARGET_URL" >> $GITHUB_ENV
+
+    - name: 🌿 创建并推送到目标仓库
+      run: |
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        NEW_BRANCH="${{ github.event.inputs.target_branch }}$TIMESTAMP"
+        echo "新分支名称: $NEW_BRANCH"
+        
+        # 进入源仓库目录
+        cd source-repo
+        
+        # 添加目标仓库作为远程仓库
+        git remote add target-repo $TARGET_CLONE_URL
+        git remote -v
+        
+        # 获取目标仓库的默认分支
+        echo "获取目标仓库信息..."
+        git fetch target-repo --depth=1
+        
+        # 创建新分支并推送到目标仓库
+        echo "创建并推送分支: $NEW_BRANCH"
+        git push target-repo HEAD:refs/heads/$NEW_BRANCH
+        
+        echo "NEW_BRANCH_NAME=$NEW_BRANCH" >> $GITHUB_ENV
+        echo "TARGET_REPO_FULL=$(echo ${{ github.event.inputs.target_repo }} | sed 's|https://github.com/||')" >> $GITHUB_ENV
+
+    - name: 📊 显示同步结果
+      run: |
+        echo "🎉 同步完成！"
+        echo "📋 同步详情："
+        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "  源分支: ${{ github.event.inputs.source_branch }}"
+        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "  新分支: $NEW_BRANCH_NAME"
+        echo ""
+        echo "🔗 创建PR的链接："
+        echo "  https://github.com/$TARGET_REPO_FULL/compare/$NEW_BRANCH_NAME?expand=1"
+
+    - name: 🎯 创建Pull Request到目标仓库
+      if: ${{ github.event.inputs.create_pr == 'true' }}
+      uses: actions/github-script@v6
+      env:
+        TARGET_REPO_OWNER: ${{ fromJSON(format('"{0}"', split(github.event.inputs.target_repo, '/')[4])) }}
+        TARGET_REPO_NAME: ${{ fromJSON(format('"{0}"', split(github.event.inputs.target_repo, '/')[5])) }}
+      with:
+        script: |
+          try {
+            // 解析目标仓库信息
+            const targetRepoUrl = '${{ github.event.inputs.target_repo }}';
+            const repoPath = targetRepoUrl.replace('https://github.com/', '');
+            const [owner, repo] = repoPath.split('/');
+            
+            const newBranch = '$NEW_BRANCH_NAME';
+            const sourceRepo = '${{ github.event.inputs.source_repo }}';
+            const sourceBranch = '${{ github.event.inputs.source_branch }}';
+            
+            console.log(`目标仓库: ${owner}/${repo}`);
+            console.log(`新分支: ${newBranch}`);
+            
+            // 获取目标仓库的默认分支
+            const targetRepo = await github.rest.repos.get({
+              owner: owner,
+              repo: repo
+            });
+            const baseBranch = targetRepo.data.default_branch;
+            
+            console.log(`目标仓库默认分支: ${baseBranch}`);
+            
+            // 创建Pull Request
+            const pr = await github.rest.pulls.create({
+              owner: owner,
+              repo: repo,
+              title: `🔀 同步更新: ${newBranch}`,
+              body: `这是一个自动创建的Pull Request，用于同步来自 **${sourceRepo}** 仓库的更改。
+              
+              ## 同步信息
+              - **源仓库**: ${sourceRepo}
+              - **源分支**: ${sourceBranch}
+              - **目标分支**: ${newBranch}
+              - **同步时间**: ${new Date().toISOString()}
+              - **同步触发**: ${{ github.repository }}
+              
+              ## 操作说明
+              - 检查更改内容
+              - 如有冲突需要手动解决
+              - 合并后可以删除源分支`,
+              head: newBranch,
+              base: baseBranch
+            });
+            
+            console.log('✅ PR创建成功:', pr.data.html_url);
+            console.log('🔗 PR链接:', pr.data.html_url);
+            
+          } catch (error) {
+            if (error.status === 422 && error.message.includes('A pull request already exists')) {
+              console.log('ℹ️ PR已存在，跳过创建');
+            } else {
+              console.log('❌ PR创建失败:', error.message);
+              console.log('但代码同步已完成，可以手动创建PR');
+            }
+          }
+
+    - name: ✅ 同步完成总结
+      run: |
+        echo "🎊 同步流程完成！"
         echo "=========================================="
-        echo "📎 访问链接: https://github.com/${{ github.event.inputs.target_repo }}/tree/${{ github.event.inputs.target_branch }}"
+        echo "📤 源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "📥 目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "🌿 新分支: $NEW_BRANCH_NAME"
+        echo "🔗 手动创建PR链接: https://github.com/$TARGET_REPO_FULL/compare/$NEW_BRANCH_NAME?expand=1"
         echo "=========================================="
