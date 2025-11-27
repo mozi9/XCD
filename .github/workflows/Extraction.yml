@@ -1,4 +1,4 @@
-name: Robust File Synchronization
+name: Complete File Synchronization
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ env:
   GIT_EMAIL: "mozi9@users.noreply.github.com"
 
 jobs:
-  robust-file-sync:
+  complete-file-sync:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -41,7 +41,7 @@ jobs:
     - name: 🔍 验证输入参数
       id: validate-inputs
       run: |
-        echo "=== 可靠文件同步 ==="
+        echo "=== 完整文件同步 ==="
         echo "提交链接: ${{ github.event.inputs.commit_urls }}"
         
         if [[ -z "${{ github.event.inputs.commit_urls }}" ]]; then
@@ -115,11 +115,23 @@ jobs:
         readarray -t COMMITS < commit_hashes.txt
         readarray -t REPOS < repo_names.txt
         
+        if [ ${#COMMITS[@]} -eq 0 ]; then
+          echo "❌ 没有提交信息"
+          exit 1
+        fi
+        
+        # 使用第一个提交的仓库信息
+        FIRST_REPO="${REPOS[0]}"
+        FIRST_COMMIT="${COMMITS[0]}"
+        
+        echo "分析仓库: $FIRST_REPO"
+        echo "分析提交: $FIRST_COMMIT"
+        
         # 存储文件信息
-        all_commit_files=()
-        files_to_add=()
-        files_to_modify=()
-        files_to_delete=()
+        all_files=()
+        added_files=()
+        modified_files=()
+        deleted_files=()
         
         for i in "${!COMMITS[@]}"; do
           COMMIT="${COMMITS[$i]}"
@@ -147,30 +159,30 @@ jobs:
                   # 验证文件名有效性
                   if [ -n "$filename" ] && [ "$filename" != "null" ] && [ ${#filename} -gt 1 ]; then
                     # 添加到总文件列表（去重）
-                    if [[ ! " ${all_commit_files[@]} " =~ " ${filename} " ]]; then
-                      all_commit_files+=("$filename")
+                    if [[ ! " ${all_files[@]} " =~ " ${filename} " ]]; then
+                      all_files+=("$filename")
                     fi
                     
                     # 根据状态分类
                     case $status in
                       added|A)
-                        if [[ ! " ${files_to_add[@]} " =~ " ${filename} " ]]; then
-                          files_to_add+=("$filename")
+                        if [[ ! " ${added_files[@]} " =~ " ${filename} " ]]; then
+                          added_files+=("$filename")
                         fi
                         ;;
                       modified|M)
-                        if [[ ! " ${files_to_modify[@]} " =~ " ${filename} " ]]; then
-                          files_to_modify+=("$filename")
+                        if [[ ! " ${modified_files[@]} " =~ " ${filename} " ]]; then
+                          modified_files+=("$filename")
                         fi
                         ;;
                       removed|D)
-                        if [[ ! " ${files_to_delete[@]} " =~ " ${filename} " ]]; then
-                          files_to_delete+=("$filename")
+                        if [[ ! " ${deleted_files[@]} " =~ " ${filename} " ]]; then
+                          deleted_files+=("$filename")
                         fi
                         ;;
                       renamed|R)
-                        if [[ ! " ${files_to_modify[@]} " =~ " ${filename} " ]]; then
-                          files_to_modify+=("$filename")
+                        if [[ ! " ${modified_files[@]} " =~ " ${filename} " ]]; then
+                          modified_files+=("$filename")
                         fi
                         ;;
                     esac
@@ -188,21 +200,21 @@ jobs:
         done
         
         # 保存文件列表
-        printf "%s\n" "${all_commit_files[@]}" | sort -u > all_commit_files.txt
-        printf "%s\n" "${files_to_add[@]}" | sort -u > files_to_add.txt
-        printf "%s\n" "${files_to_modify[@]}" | sort -u > files_to_modify.txt
-        printf "%s\n" "${files_to_delete[@]}" | sort -u > files_to_delete.txt
+        printf "%s\n" "${all_files[@]}" | sort -u > all_files.txt
+        printf "%s\n" "${added_files[@]}" | sort -u > added_files.txt
+        printf "%s\n" "${modified_files[@]}" | sort -u > modified_files.txt
+        printf "%s\n" "${deleted_files[@]}" | sort -u > deleted_files.txt
         
-        echo "all_files_count=${#all_commit_files[@]}" >> $GITHUB_OUTPUT
-        echo "add_count=${#files_to_add[@]}" >> $GITHUB_OUTPUT
-        echo "modify_count=${#files_to_modify[@]}" >> $GITHUB_OUTPUT
-        echo "delete_count=${#files_to_delete[@]}" >> $GITHUB_OUTPUT
+        echo "all_files_count=${#all_files[@]}" >> $GITHUB_OUTPUT
+        echo "added_count=${#added_files[@]}" >> $GITHUB_OUTPUT
+        echo "modified_count=${#modified_files[@]}" >> $GITHUB_OUTPUT
+        echo "deleted_count=${#deleted_files[@]}" >> $GITHUB_OUTPUT
         
-        echo "✅ 分析完成:"
-        echo "   所有文件: ${#all_commit_files[@]} 个"
-        echo "   新增文件: ${#files_to_add[@]} 个"
-        echo "   修改文件: ${#files_to_modify[@]} 个"
-        echo "   删除文件: ${#files_to_delete[@]} 个"
+        echo "✅ 文件分析完成:"
+        echo "   所有文件: ${#all_files[@]} 个"
+        echo "   新增文件: ${#added_files[@]} 个"
+        echo "   修改文件: ${#modified_files[@]} 个"
+        echo "   删除文件: ${#deleted_files[@]} 个"
 
     - name: 📥 可靠下载源文件
       id: download-source-files
@@ -229,9 +241,10 @@ jobs:
         # 下载统计
         downloaded_count=0
         failed_count=0
+        skipped_count=0
         
-        if [ -s all_commit_files.txt ]; then
-          total_files=$(wc -l < all_commit_files.txt)
+        if [ -s all_files.txt ]; then
+          total_files=$(wc -l < all_files.txt)
           echo "开始下载 $total_files 个文件..."
           
           while IFS= read -r file; do
@@ -241,20 +254,17 @@ jobs:
             raw_url="https://raw.githubusercontent.com/$FIRST_REPO/$FIRST_COMMIT/$file"
             
             echo "下载: $file"
-            echo "URL: $raw_url"
             
             # 创建目录结构
             mkdir -p "source-files/$(dirname "$file")"
             
             # 下载文件（增强的重试机制）
-            max_retries=5
+            max_retries=3
             retry_count=0
             success=false
             
             while [ $retry_count -lt $max_retries ] && [ "$success" = false ]; do
-              # 尝试不同的下载方法
-              
-              # 方法1: 使用curl直接下载
+              # 尝试下载文件
               if curl -s -f -L "$raw_url" -o "source-files/$file"; then
                 if [ -s "source-files/$file" ]; then
                   success=true
@@ -290,6 +300,8 @@ jobs:
                       fi
                     fi
                   fi
+                else
+                  echo "❌ 文件不存在 (HTTP $http_code): $file"
                 fi
               fi
               
@@ -297,7 +309,7 @@ jobs:
                 retry_count=$((retry_count + 1))
                 if [ $retry_count -lt $max_retries ]; then
                   echo "等待重试... ($retry_count/$max_retries)"
-                  sleep 2
+                  sleep 1
                 fi
               fi
             done
@@ -311,9 +323,9 @@ jobs:
             fi
             
             # 短暂延迟避免限流
-            sleep 0.2
+            sleep 0.1
             
-          done < all_commit_files.txt
+          done < all_files.txt
         fi
         
         echo "downloaded_count=$downloaded_count" >> $GITHUB_OUTPUT
@@ -322,12 +334,6 @@ jobs:
         echo "✅ 下载完成:"
         echo "   成功下载: $downloaded_count 个文件"
         echo "   下载失败: $failed_count 个文件"
-        
-        # 显示下载失败的文件
-        if [ -f failed_downloads.txt ] && [ -s failed_downloads.txt ]; then
-          echo "❌ 下载失败的文件列表:"
-          cat failed_downloads.txt
-        fi
 
     - name: 🔄 强制同步所有文件
       id: force-sync-files
@@ -342,7 +348,7 @@ jobs:
         error_count=0
         
         # 1. 处理删除文件
-        if [ -s files_to_delete.txt ]; then
+        if [ -s deleted_files.txt ]; then
           echo "=== 删除文件 ==="
           while IFS= read -r file; do
             [ -z "$file" ] && continue
@@ -370,13 +376,13 @@ jobs:
               skipped_count=$((skipped_count + 1))
               echo "⏭️  跳过删除: $file (目标文件不存在)"
             fi
-          done < files_to_delete.txt
+          done < deleted_files.txt
         fi
         
         # 2. 处理新增和修改文件（强制覆盖）
-        if [ -s all_commit_files.txt ]; then
+        if [ -s all_files.txt ]; then
           echo "=== 强制复制文件 ==="
-          total_files=$(wc -l < all_commit_files.txt)
+          total_files=$(wc -l < all_files.txt)
           current_file=0
           
           while IFS= read -r file; do
@@ -392,14 +398,8 @@ jobs:
               if cp -f "source-files/$file" "target-repo/$file"; then
                 # 判断是新增还是修改
                 if [ -f "target-repo/$file" ]; then
-                  # 检查文件是否已存在（修改）
-                  if [ -f "target-repo/$file" ] && [ -s "target-repo/$file" ]; then
-                    modified_count=$((modified_count + 1))
-                    echo "✏️  修改 ($current_file/$total_files): $file"
-                  else
-                    added_count=$((added_count + 1))
-                    echo "➕ 新增 ($current_file/$total_files): $file"
-                  fi
+                  modified_count=$((modified_count + 1))
+                  echo "✏️  修改 ($current_file/$total_files): $file"
                 else
                   added_count=$((added_count + 1))
                   echo "➕ 新增 ($current_file/$total_files): $file"
@@ -415,7 +415,7 @@ jobs:
               # 记录跳过的文件
               echo "$file" >> skipped_files.txt
             fi
-          done < all_commit_files.txt
+          done < all_files.txt
         fi
         
         echo "added_count=$added_count" >> $GITHUB_OUTPUT
@@ -487,19 +487,28 @@ jobs:
       if: always()
       run: |
         cat > "$GITHUB_STEP_SUMMARY" << EOF
-        # 可靠文件同步报告
+        # 完整文件同步报告
         
         ## 总体统计
         - **分析提交**: ${{ steps.parse-commit-urls.outputs.commits_count }} 个
         - **提交中文件**: ${{ steps.get-commit-files.outputs.all_files_count }} 个
         - **下载结果**: ${{ steps.download-source-files.outputs.downloaded_count }} 成功, ${{ steps.download-source-files.outputs.failed_count }} 失败
-        - **同步结果**: ${{ steps.force-sync-files.outputs.added_count }} 新增, ${{ steps.force-sync-files.outputs.modified_count }} 修改, ${{ steps.force-sync-files.outputs.deleted_count }} 删除
+        - **文件操作**: ${{ steps.force-sync-files.outputs.added_count }} 新增, ${{ steps.force-sync-files.outputs.modified_count }} 修改, ${{ steps.force-sync-files.outputs.deleted_count }} 删除
         - **跳过文件**: ${{ steps.force-sync-files.outputs.skipped_count }} 个
         - **最终提交**: ${{ steps.commit-changes.outputs.changed_files_count || '0' }} 个文件
         - **操作状态**: ${{ steps.commit-changes.outputs.has_changes == 'true' && '✅ 成功提交' || 'ℹ️ 无变更' }}
         
         ## 详细操作记录
         EOF
+        
+        # 显示所有处理的文件
+        if [ -s all_files.txt ]; then
+          echo "### 📄 处理的文件 (${{ steps.get-commit-files.outputs.all_files_count }} 个)" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r file; do
+            echo "- \`$file\`" >> "$GITHUB_STEP_SUMMARY"
+          done < all_files.txt
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+        fi
         
         # 显示下载失败的文件
         if [ -f failed_downloads.txt ] && [ -s failed_downloads.txt ]; then
@@ -520,18 +529,18 @@ jobs:
         fi
         
         cat >> "$GITHUB_STEP_SUMMARY" << EOF
-        ## 问题诊断
-        - **下载失败**: 可能由于GitHub限流或文件路径问题
-        - **跳过文件**: 源文件下载失败或为空
-        - **解决方案**: 使用增强的下载重试机制
+        ## 操作说明
+        - **强制复制**: 从源仓库强制复制所有文件到目标仓库
+        - **强制删除**: 删除源提交中标记为删除的文件
+        - **完全覆盖**: 不比较内容，直接覆盖所有文件
         
-        **执行时间**: 预计3-5分钟
+        **执行时间**: 预计2-3分钟
         EOF
 
     - name: 🧹 清理临时文件
       if: always()
       run: |
         rm -rf source-files
-        rm -f commit_hashes.txt repo_names.txt all_commit_files.txt
-        rm -f files_to_add.txt files_to_modify.txt files_to_delete.txt
+        rm -f commit_hashes.txt repo_names.txt all_files.txt
+        rm -f added_files.txt modified_files.txt deleted_files.txt
         rm -f failed_downloads.txt skipped_files.txt 2>/dev/null || true
