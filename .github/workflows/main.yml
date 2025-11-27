@@ -1,11 +1,12 @@
-name: 🔄 Quick Repo Sync
+name: 🔄 Repository Sync
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库 (owner/repo)'
+        description: '源仓库 (格式：owner/repo)'
         required: true
+        default: 'mozi9/kernel_xiaomi_sm8250'
         type: string
       source_branch:
         description: '源分支'
@@ -13,39 +14,47 @@ on:
         default: 'main'
         type: string
       target_repo:
-        description: '目标仓库 (owner/repo)'
+        description: '目标仓库 (格式：owner/repo)'
         required: true
+        default: 'mozi9/target-repo'
         type: string
-      new_branch:
-        description: '新分支名'
+      target_branch:
+        description: '目标分支名'
         required: true
-        default: 'sync-branch'
+        default: 'sync-update'
         type: string
 
 env:
   PAT_TOKEN: ${{ secrets.Mozi9_PAT }}
 
 jobs:
-  sync:
+  sync-repo:
     runs-on: ubuntu-latest
     steps:
-      - name: 🔄 同步代码
-        run: |
-          # 配置git
-          git config --global user.name "mozi9"
-          git config --global user.email "mozi9"
-          
-          # 克隆源仓库
-          git clone --depth 1 \
-            -b "${{ github.event.inputs.source_branch }}" \
-            "https://mozi9:${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.source_repo }}.git" \
-            source
-          
-          # 推送到目标仓库
-          cd source
-          git push \
-            "https://mozi9:${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.target_repo }}.git" \
-            HEAD:refs/heads/${{ github.event.inputs.new_branch }}
-          
-          echo "✅ 完成！分支: ${{ github.event.inputs.new_branch }}"
-          echo "🔗 https://github.com/${{ github.event.inputs.target_repo }}/tree/${{ github.event.inputs.new_branch }}"
+    - name: 🔄 同步仓库
+      run: |
+        # 正确配置Git
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
+        
+        # 清理可能存在的临时目录
+        rm -rf /tmp/repo-sync
+        mkdir -p /tmp/repo-sync
+        cd /tmp/repo-sync
+        
+        # 正确格式的仓库URL
+        SOURCE_URL="https://mozi9:${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.source_repo }}.git"
+        TARGET_URL="https://mozi9:${{ env.PAT_TOKEN }}@github.com/${{ github.event.inputs.target_repo }}.git"
+        
+        echo "正在克隆源仓库: $SOURCE_URL"
+        git clone --depth 1 -b "${{ github.event.inputs.source_branch }}" "$SOURCE_URL" source-repo
+        
+        cd source-repo
+        echo "当前分支: $(git branch --show-current)"
+        
+        echo "正在推送到目标仓库: $TARGET_URL"
+        git push "$TARGET_URL" HEAD:refs/heads/${{ github.event.inputs.target_branch }}
+        
+        echo "✅ 同步完成！"
+        echo "分支: ${{ github.event.inputs.target_branch }}"
+        echo "链接: https://github.com/${{ github.event.inputs.target_repo }}/tree/${{ github.event.inputs.target_branch }}"
