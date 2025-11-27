@@ -1,4 +1,4 @@
-name: 🔄 Simple Repo Sync
+name: Simple Repo Sync
 
 on:
   workflow_dispatch:
