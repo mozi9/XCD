@@ -1,4 +1,4 @@
-name: Complete Commit File Sync Workflow
+name: Complete Commit Sync Workflow
 
 on:
   workflow_dispatch:
@@ -24,12 +24,11 @@ env:
   GIT_USERNAME: "mozi9"
 
 jobs:
-  step1-push-commit-files:
+  step1-push-commit:
     runs-on: ubuntu-latest
     outputs:
       commit_hash: ${{ steps.parse-commit.outputs.commit_hash }}
       source_repo: ${{ steps.parse-commit.outputs.source_repo }}
-      file_count: ${{ steps.get-commit-files.outputs.file_count }}
     
     steps:
     - name: 配置Git
@@ -43,6 +42,7 @@ jobs:
         repository: ${{ github.event.inputs.target_repo }}
         ref: ${{ github.event.inputs.target_branch }}
         token: ${{ secrets.Mozi9_PAT }}
+        fetch-depth: 0
 
     - name: 解析提交链接
       id: parse-commit
@@ -53,57 +53,70 @@ jobs:
           echo "source_repo=${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
         fi
 
-    - name: 获取提交中的文件列表
-      id: get-commit-files
+    - name: 添加源仓库远程
+      run: |
+        git remote add source-repo https://${{ env.GIT_USERNAME }}:${{ secrets.Mozi9_PAT }}@github.com/${{ steps.parse-commit.outputs.source_repo }}.git
+        git fetch source-repo ${{ steps.parse-commit.outputs.commit_hash }}
+
+    - name: 强制推送提交到目标仓库
       run: |
         COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
-        SOURCE_REPO="${{ steps.parse-commit.outputs.source_repo }}"
-        
-        # 获取提交中的文件列表
-        curl -s -H "Authorization: token ${{ secrets.Mozi9_PAT }}" \
-          "https://api.github.com/repos/$SOURCE_REPO/git/trees/$COMMIT_HASH?recursive=1" | \
-          jq -r '.tree[] | select(.type == "blob") | .path' | sort -u > commit_files.txt
-        
-        echo "提交中的文件数: $(wc -l < commit_files.txt)"
-        echo "file_count=$(wc -l < commit_files.txt)" >> $GITHUB_OUTPUT
+        git reset --hard $COMMIT_HASH
+        git push --force origin ${{ github.event.inputs.target_branch }}
+        echo "✅ 提交已推送到目标仓库"
 
-    - name: 清空目标仓库工作区
-      run: |
-        # 清空目标仓库，只保留.git目录
-        find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
-        echo "目标仓库工作区已清空"
-
-    - name: 下载提交中的文件
-      run: |
-        COMMIT_HASH="${{ steps.parse-commit.outputs.commit_hash }}"
-        SOURCE_REPO="${{ steps.parse-commit.outputs.source_repo }}"
-        
-        download_count=0
-        while IFS= read -r file; do
-          if [ -n "$file" ]; then
-            mkdir -p "$(dirname "$file")"
-            curl -s -H "Authorization: token ${{ secrets.Mozi9_PAT }}" \
-              "https://raw.githubusercontent.com/$SOURCE_REPO/$COMMIT_HASH/$file" -o "$file"
-            download_count=$((download_count + 1))
-            echo "下载: $file"
-          fi
-        done < commit_files.txt
-        
-        echo "✅ 下载完成: $download_count 个文件"
-
-    - name: 提交到目标仓库
-      run: |
-        git add -A
-        git commit -m "${{ github.event.inputs.commit_message }}"
-        git push origin ${{ github.event.inputs.target_branch }}
-        echo "✅ 提交推送到目标仓库完成"
-
-  step2-process-target-files:
+  step2-get-commit-files:
     runs-on: ubuntu-latest
-    needs: step1-push-commit-files
+    needs: step1-push-commit
     outputs:
-      processed_count: ${{ steps.process-files.outputs.processed_count }}
+      added_files: ${{ steps.analyze-files.outputs.added_files }}
+      modified_files: ${{ steps.analyze-files.outputs.modified_files }}
+      deleted_files: ${{ steps.analyze-files.outputs.deleted_files }}
     
+    steps:
+    - name: 配置Git
+      run: |
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9@users.noreply.github.com"
+
+    - name: 克隆目标仓库
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        ref: ${{ github.event.inputs.target_branch }}
+        token: ${{ secrets.Mozi9_PAT }}
+        fetch-depth: 0
+
+    - name: 分析提交文件变更
+      id: analyze-files
+      run: |
+        COMMIT_HASH="${{ needs.step1-push-commit.outputs.commit_hash }}"
+        
+        # 获取父提交
+        PARENT_COMMIT=$(git log --pretty=%P -n 1 $COMMIT_HASH | awk '{print $1}')
+        
+        if [ -n "$PARENT_COMMIT" ]; then
+          # 新增和修改的文件
+          git diff --name-only --diff-filter=AM $PARENT_COMMIT $COMMIT_HASH > added_files.txt
+          # 删除的文件
+          git diff --name-only --diff-filter=D $PARENT_COMMIT $COMMIT_HASH > deleted_files.txt
+          
+          echo "added_files=added_files.txt" >> $GITHUB_OUTPUT
+          echo "deleted_files=deleted_files.txt" >> $GITHUB_OUTPUT
+          echo "新增/修改文件: $(wc -l < added_files.txt)"
+          echo "删除文件: $(wc -l < deleted_files.txt)"
+        else
+          # 初始提交
+          git ls-tree -r --name-only $COMMIT_HASH > added_files.txt
+          touch deleted_files.txt
+          echo "added_files=added_files.txt" >> $GITHUB_OUTPUT
+          echo "deleted_files=deleted_files.txt" >> $GITHUB_OUTPUT
+          echo "初始提交，所有文件为新增: $(wc -l < added_files.txt)"
+        fi
+
+  step3-process-target-files:
+    runs-on: ubuntu-latest
+    needs: step2-get-commit-files
     steps:
     - name: 配置Git
       run: |
@@ -118,107 +131,56 @@ jobs:
         token: ${{ secrets.Mozi9_PAT }}
         fetch-depth: 0
 
-    - name: 分析提交文件变更
-      id: analyze-changes
+    - name: 在目标仓库中删除文件
       run: |
-        COMMIT_HASH="${{ needs.step1-push-commit-files.outputs.commit_hash }}"
-        
-        # 获取父提交
-        PARENT_COMMIT=$(git log --pretty=%P -n 1 $COMMIT_HASH | awk '{print $1}')
-        
-        if [ -n "$PARENT_COMMIT" ]; then
-          echo "分析提交变更: $PARENT_COMMIT -> $COMMIT_HASH"
-          git diff --name-only --diff-filter=AM $PARENT_COMMIT $COMMIT_HASH > files_to_add.txt
-          git diff --name-only --diff-filter=D $PARENT_COMMIT $COMMIT_HASH > files_to_delete.txt
-        else
-          echo "初始提交"
-          git ls-tree -r --name-only $COMMIT_HASH > files_to_add.txt
-          touch files_to_delete.txt
-        fi
-        
-        echo "新增/修改文件: $(wc -l < files_to_add.txt)"
-        echo "删除文件: $(wc -l < files_to_delete.txt)"
-
-    - name: 删除目标仓库中的文件
-      id: delete-files
-      run: |
-        delete_count=0
-        if [ -s files_to_delete.txt ]; then
+        if [ -f "${{ needs.step2-get-commit-files.outputs.deleted_files }}" ]; then
           while IFS= read -r file; do
-            if [ -n "$file" ] && [ -e "$file" ]; then
-              rm -rf "$file"
-              delete_count=$((delete_count + 1))
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              rm -f "$file"
               echo "删除: $file"
             fi
-          done < files_to_delete.txt
+          done < "${{ needs.step2-get-commit-files.outputs.deleted_files }}"
         fi
-        echo "删除文件数: $delete_count"
-        echo "delete_count=$delete_count" >> $GITHUB_OUTPUT
 
-    - name: 检出文件到目标仓库
-      id: checkout-files
+    - name: 在目标仓库中检出文件
       run: |
-        COMMIT_HASH="${{ needs.step1-push-commit-files.outputs.commit_hash }}"
-        checkout_count=0
-        if [ -s files_to_add.txt ]; then
+        COMMIT_HASH="${{ needs.step1-push-commit.outputs.commit_hash }}"
+        if [ -f "${{ needs.step2-get-commit-files.outputs.added_files }}" ]; then
           while IFS= read -r file; do
             if [ -n "$file" ]; then
               mkdir -p "$(dirname "$file")"
-              if git show $COMMIT_HASH:"$file" > "$file" 2>/dev/null; then
-                checkout_count=$((checkout_count + 1))
-                echo "检出: $file"
-              fi
+              git show $COMMIT_HASH:"$file" > "$file"
+              echo "检出: $file"
             fi
-          done < files_to_add.txt
+          done < "${{ needs.step2-get-commit-files.outputs.added_files }}"
         fi
-        echo "检出文件数: $checkout_count"
-        echo "checkout_count=$checkout_count" >> $GITHUB_OUTPUT
 
     - name: 提交目标仓库处理结果
-      id: commit-result
       run: |
-        processed_count=$(({{ steps.delete-files.outputs.delete_count }} + {{ steps.checkout-files.outputs.checkout_count }}))
-        
         git add -A
-        if git diff-index --quiet HEAD --; then
-          echo "无文件变更需要提交"
-          echo "has_changes=false" >> $GITHUB_OUTPUT
-        else
+        if ! git diff-index --quiet HEAD --; then
           git commit -m "目标仓库文件处理: ${{ github.event.inputs.commit_message }}"
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-          echo "处理文件数: $processed_count"
+          git push origin ${{ github.event.inputs.target_branch }}
+          echo "✅ 目标仓库文件处理完成"
         fi
-        echo "processed_count=$processed_count" >> $GITHUB_OUTPUT
 
-    - name: 推送处理结果
-      if: steps.commit-result.outputs.has_changes == 'true'
-      run: |
-        git push origin ${{ github.event.inputs.target_branch }}
-        echo "✅ 目标仓库处理结果推送完成"
-
-  step3-generate-report:
+  step4-generate-report:
     runs-on: ubuntu-latest
-    needs: [step1-push-commit-files, step2-process-target-files]
-    
+    needs: [step1-push-commit, step3-process-target-files]
     steps:
-    - name: 生成工作报告
+    - name: 生成报告
       run: |
-        cat << EOF > $GITHUB_STEP_SUMMARY
-        # 文件同步工作报告
-        
-        ## 执行概览
-        - ✅ 步骤1: 提交文件推送完成
-        - ✅ 步骤2: 目标仓库文件处理完成
-        
-        ## 详细统计
-        - **源提交**: ${{ needs.step1-push-commit-files.outputs.commit_hash }}
-        - **提交文件数**: ${{ needs.step1-push-commit-files.outputs.file_count }}
-        - **处理文件数**: ${{ needs.step2-process-target-files.outputs.processed_count || 0 }}
-        - **目标仓库**: ${{ github.event.inputs.target_repo }}
-        - **目标分支**: ${{ github.event.inputs.target_branch }}
-        
-        ## 执行状态
-        - 工作流: ${{ github.workflow }}
-        - 运行ID: ${{ github.run_id }}
-        - 执行时间: $(date)
-        EOF
+        echo "# 完整工作流程报告" > $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 步骤1: 推送提交 ✅ 完成" >> $GITHUB_STEP_SUMMARY
+        echo "- 提交哈希: ${{ needs.step1-push-commit.outputs.commit_hash }}" >> $GITHUB_STEP_SUMMARY
+        echo "- 源仓库: ${{ needs.step1-push-commit.outputs.source_repo }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 步骤2: 分析文件变更 ✅ 完成" >> $GITHUB_STEP_SUMMARY
+        echo "- 新增/修改文件: $(cat ${{ needs.step2-get-commit-files.outputs.added_files }} 2>/dev/null | wc -l || echo 0)" >> $GITHUB_STEP_SUMMARY
+        echo "- 删除文件: $(cat ${{ needs.step2-get-commit-files.outputs.deleted_files }} 2>/dev/null | wc -l || echo 0)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 步骤3: 目标仓库文件处理 ✅ 完成" >> $GITHUB_STEP_SUMMARY
+        echo "- 状态: 文件处理已完成" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## 工作流程执行完成" >> $GITHUB_STEP_SUMMARY
