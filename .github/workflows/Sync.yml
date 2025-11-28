@@ -1,4 +1,4 @@
-name: Manual Repository Sync - Extract and Pack Files
+name: Repository Sync - Extract and Commit Files
 
 on:
   workflow_dispatch:
@@ -26,18 +26,19 @@ on:
       commit_name:
         description: '自定义提交名称'
         required: true
-        default: 'mozi9: 同步文件包'
+        default: 'mozi9: 文件同步'
       commit_message:
         description: '自定义提交信息'
         required: true
-        default: '从源仓库提取并打包文件'
+        default: '从源仓库同步文件'
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  sync-repository:
+  sync-files:
     runs-on: ubuntu-latest
+    
     steps:
     - name: Checkout target repository
       uses: actions/checkout@v4
@@ -47,231 +48,192 @@ jobs:
         ref: ${{ github.event.inputs.target_branch }}
         fetch-depth: 0
 
-    - name: Add source repository as remote
+    - name: Add source repository remote
       run: |
         git remote add source-repo https://github.com/${{ github.event.inputs.source_repo }}.git
         git fetch source-repo ${{ github.event.inputs.source_branch }}
 
-    - name: Setup Git config for Mozi9
+    - name: Configure Git identity
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9"
 
-    - name: Parse commit hashes
-      id: parse_commits
+    - name: Parse and validate commit hashes
+      id: parse-commits
       run: |
-        # 清理和验证提交哈希
-        CLEAN_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' '\n' | grep -v '^$')
-        
+        # Clean and split commit hashes
+        CLEAN_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' '\n')
         VALID_COMMITS=""
-        COMMIT_COUNT=0
+        COUNT=0
         
         for hash in $CLEAN_HASHES; do
-          if git rev-parse $hash >/dev/null 2>&1; then
+          if [ -n "$hash" ] && git rev-parse "$hash" >/dev/null 2>&1; then
             VALID_COMMITS="$VALID_COMMITS$hash"$'\n'
-            COMMIT_COUNT=$((COMMIT_COUNT + 1))
-            echo "✅ 提交有效: $hash"
+            COUNT=$((COUNT + 1))
+            echo "✅ Valid commit: $hash"
           else
-            echo "❌ 提交无效: $hash"
+            echo "❌ Invalid commit: $hash"
           fi
         done
         
-        if [ $COMMIT_COUNT -eq 0 ]; then
-          echo "错误: 没有找到有效的提交哈希"
+        if [ $COUNT -eq 0 ]; then
+          echo "No valid commits found"
           exit 1
         fi
         
         echo "$VALID_COMMITS" > /tmp/valid_commits.txt
-        echo "找到 $COMMIT_COUNT 个有效提交"
-        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+        echo "count=$COUNT" >> $GITHUB_OUTPUT
+        echo "Found $COUNT valid commits"
 
     - name: Analyze file changes from source commits
-      id: analyze_files
+      id: analyze-files
       run: |
-        COMMITS=$(cat /tmp/valid_commits.txt)
+        echo "Analyzing file changes from source commits..."
         
-        # 用于跟踪文件操作
+        # Initialize arrays
         declare -A files_to_add
         declare -A files_to_delete
         
-        echo "分析源提交中的文件变更..."
-        
-        for COMMIT in $COMMITS; do
-          echo "分析提交: $COMMIT"
+        # Read commits
+        while IFS= read -r commit; do
+          [ -z "$commit" ] && continue
+          echo "Analyzing commit: $commit"
           
-          # 获取提交的文件变更状态
-          git show $COMMIT --name-status --format= > /tmp/commit_changes.txt 2>/dev/null || true
+          # Get file changes
+          git show "$commit" --name-status --format= > /tmp/changes.txt 2>/dev/null || true
           
-          # 处理文件变更
           while IFS=$'\t' read -r status file1 file2; do
             case "$status" in
-              A|M|C)  # 新增、修改、复制 - 需要添加的文件
+              A|M|C)  # Add/Modify/Copy
                 if [ -n "$file1" ]; then
-                  files_to_add["$file1"]="$COMMIT"
-                  echo "📄 需要添加: $file1"
-                fi
-                if [ -n "$file2" ]; then  # 复制或重命名的新文件
-                  files_to_add["$file2"]="$COMMIT"
-                  echo "📄 需要添加: $file2"
-                fi
-                ;;
-              D)  # 删除 - 需要删除的文件
-                if [ -n "$file1" ]; then
-                  files_to_delete["$file1"]="$COMMIT"
-                  echo "🗑️ 需要删除: $file1"
-                fi
-                ;;
-              R)  # 重命名
-                if [ -n "$file1" ]; then
-                  files_to_delete["$file1"]="$COMMIT"  # 原文件删除
-                  echo "🗑️ 需要删除(重命名): $file1"
+                  files_to_add["$file1"]=1
                 fi
                 if [ -n "$file2" ]; then
-                  files_to_add["$file2"]="$COMMIT"  # 新文件添加
-                  echo "📄 需要添加(重命名): $file2"
+                  files_to_add["$file2"]=1
+                fi
+                ;;
+              D)  # Delete
+                if [ -n "$file1" ]; then
+                  files_to_delete["$file1"]=1
+                fi
+                ;;
+              R)  # Rename
+                if [ -n "$file1" ]; then
+                  files_to_delete["$file1"]=1
+                fi
+                if [ -n "$file2" ]; then
+                  files_to_add["$file2"]=1
                 fi
                 ;;
             esac
-          done < <(grep -v '^$' /tmp/commit_changes.txt | sed 's/^[ \t]*//;s/[ \t]*$//')
-        done
+          done < <(grep -v '^$' /tmp/changes.txt)
+        done < /tmp/valid_commits.txt
         
-        # 保存需要添加的文件列表
+        # Save file lists
         for file in "${!files_to_add[@]}"; do
           echo "$file" >> /tmp/files_to_add.txt
         done
         
-        # 保存需要删除的文件列表
         for file in "${!files_to_delete[@]}"; do
           echo "$file" >> /tmp/files_to_delete.txt
         done
         
-        ADD_COUNT=${#files_to_add[@]}
-        DELETE_COUNT=${#files_to_delete[@]}
+        add_count=${#files_to_add[@]}
+        del_count=${#files_to_delete[@]}
         
-        echo "文件分析完成:"
-        echo "📊 需要添加的文件数: $ADD_COUNT"
-        echo "📊 需要删除的文件数: $DELETE_COUNT"
-        
-        echo "add_count=$ADD_COUNT" >> $GITHUB_OUTPUT
-        echo "delete_count=$DELETE_COUNT" >> $GITHUB_OUTPUT
+        echo "add_count=$add_count" >> $GITHUB_OUTPUT
+        echo "del_count=$del_count" >> $GITHUB_OUTPUT
+        echo "Files to add: $add_count"
+        echo "Files to delete: $del_count"
 
-    - name: Copy files from source commits
+    - name: Copy new/modified files from source
       run: |
-        echo "从源提交复制文件到目标仓库..."
+        echo "Copying files from source commits..."
         
-        if [ ! -f "/tmp/files_to_add.txt" ] || [ ! -s "/tmp/files_to_add.txt" ]; then
-          echo "没有需要添加的文件"
+        if [ ! -f "/tmp/files_to_add.txt" ]; then
+          echo "No files to add"
           exit 0
         fi
         
-        ADD_COUNT=0
+        processed=0
         while IFS= read -r file; do
-          if [ -z "$file" ]; then
-            continue
+          [ -z "$file" ] && continue
+          
+          # Find which commit has this file
+          commit=$(grep -l "$file" /tmp/valid_commits.txt 2>/dev/null | head -1 || echo "")
+          if [ -z "$commit" ]; then
+            commit=$(head -1 /tmp/valid_commits.txt)
           fi
           
-          # 从最后一个包含该文件的提交中获取文件
-          COMMIT=$(git log --oneline -1 --format=%H -- "$file" source-repo/${{ github.event.inputs.source_branch }} 2>/dev/null || echo "")
-          
-          if [ -n "$COMMIT" ] && git show $COMMIT:"$file" >/dev/null 2>&1; then
-            # 创建目录
+          if git show "$commit:$file" >/dev/null 2>&1; then
             mkdir -p "$(dirname "$file")"
-            # 复制文件
-            git show $COMMIT:"$file" > "$file"
-            ADD_COUNT=$((ADD_COUNT + 1))
-            echo "✅ 复制文件: $file"
-          else
-            echo "❌ 无法获取文件: $file"
+            git show "$commit:$file" > "$file"
+            processed=$((processed + 1))
+            echo "📄 Copied: $file"
           fi
         done < /tmp/files_to_add.txt
         
-        echo "文件复制完成: 成功复制 $ADD_COUNT 个文件"
+        echo "Copied $processed files"
 
-    - name: Delete files marked for deletion
+    - name: Delete files marked for removal
       run: |
-        echo "删除源提交中标记为删除的文件..."
+        echo "Deleting files..."
         
-        if [ ! -f "/tmp/files_to_delete.txt" ] || [ ! -s "/tmp/files_to_delete.txt" ]; then
-          echo "没有需要删除的文件"
+        if [ ! -f "/tmp/files_to_delete.txt" ]; then
+          echo "No files to delete"
           exit 0
         fi
         
-        DELETE_COUNT=0
+        deleted=0
         while IFS= read -r file; do
-          if [ -z "$file" ]; then
-            continue
-          fi
+          [ -z "$file" ] && continue
           
-          if [ -f "$file" ] || [ -d "$file" ]; then
+          if [ -e "$file" ]; then
             rm -rf "$file"
-            DELETE_COUNT=$((DELETE_COUNT + 1))
-            echo "✅ 删除文件: $file"
-          else
-            echo "⚠️ 文件不存在，跳过删除: $file"
+            deleted=$((deleted + 1))
+            echo "🗑️ Deleted: $file"
           fi
         done < /tmp/files_to_delete.txt
         
-        echo "删除完成: 实际删除 $DELETE_COUNT 个文件"
+        echo "Deleted $deleted files"
 
-    - name: Create commit with custom message
+    - name: Create commit with custom messages
       run: |
-        echo "创建提交..."
+        echo "Creating commit..."
         
-        # 添加所有变更到暂存区
         git add .
         
-        # 检查是否有变更
         if git diff --cached --quiet; then
-          echo "没有文件变更，创建空提交"
+          echo "No changes to commit"
           git commit --allow-empty \
             -m "${{ github.event.inputs.commit_name }}" \
             -m "${{ github.event.inputs.commit_message }}" \
             --author="mozi9 <mozi9>"
         else
-          # 创建详细的提交信息
-          COMMIT_BODY="文件变更详情:
-- 添加文件: ${{ steps.analyze_files.outputs.add_count }} 个
-- 删除文件: ${{ steps.analyze_files.outputs.delete_count }} 个
-- 源提交数量: ${{ steps.parse_commits.outputs.commit_count }}
-
-源提交列表:
-$(cat /tmp/valid_commits.txt | while read commit; do 
-  [ -n "$commit" ] && echo "  - $commit"; 
-done)
-
-${{ github.event.inputs.commit_message }}"
-          
           git commit \
             -m "${{ github.event.inputs.commit_name }}" \
-            -m "$COMMIT_BODY" \
+            -m "${{ github.event.inputs.commit_message }}" \
             --author="mozi9 <mozi9>"
         fi
         
-        echo "✅ 提交创建完成"
+        echo "✅ Commit created"
 
-    - name: Push to target repository
+    - name: Push changes to target repository
       run: |
-        echo "推送到目标仓库..."
+        echo "Pushing to target repository..."
         git push origin ${{ github.event.inputs.target_branch }}
-        echo "✅ 推送完成"
+        echo "✅ Push completed"
 
-    - name: Create summary
+    - name: Generate summary
       run: |
-        echo "🎉 同步完成！"
+        echo "🎉 Sync completed successfully!"
         echo "========================================"
-        echo "处理统计:"
-        echo "📋 源提交数量: ${{ steps.parse_commits.outputs.commit_count }}"
-        echo "📦 添加文件数: ${{ steps.analyze_files.outputs.add_count }}"
-        echo "🗑️ 删除文件数: ${{ steps.analyze_files.outputs.delete_count }}"
-        echo "👤 提交作者: mozi9"
-        echo "📝 提交名称: ${{ github.event.inputs.commit_name }}"
-        echo "📖 提交信息: ${{ github.event.inputs.commit_message }}"
-        echo "🎯 目标仓库: ${{ github.event.inputs.target_repo }}"
-        echo "🌿 目标分支: ${{ github.event.inputs.target_branch }}"
-        echo ""
-        echo "添加的文件:"
-        cat /tmp/files_to_add.txt 2>/dev/null | head -10 | sed 's/^/  - /' || echo "  - 无"
-        echo ""
-        echo "删除的文件:"
-        cat /tmp/files_to_delete.txt 2>/dev/null | head -10 | sed 's/^/  - /' || echo "  - 无"
+        echo "Summary:"
+        echo "📋 Source commits: ${{ steps.parse-commits.outputs.count }}"
+        echo "📦 Files added: ${{ steps.analyze-files.outputs.add_count }}"
+        echo "🗑️ Files deleted: ${{ steps.analyze-files.outputs.del_count }}"
+        echo "👤 Commit author: mozi9"
+        echo "📝 Commit name: ${{ github.event.inputs.commit_name }}"
+        echo "🔗 Target repo: ${{ github.event.inputs.target_repo }}"
+        echo "🌿 Target branch: ${{ github.event.inputs.target_branch }}"
         echo "========================================"
