@@ -232,17 +232,17 @@ jobs:
           # Create commit message with proper formatting
           COMMIT_MESSAGE="${{ github.event.inputs.commit_name }}
 
-文件同步详情:
-  - 源仓库: ${{ github.event.inputs.source_repo }}
-  - 源分支: ${{ github.event.inputs.source_branch }}
-  - 处理提交数: ${{ steps.validate-commits.outputs.count }}
-  - 添加文件数: ${{ steps.extract-files.outputs.add_count }}
-  - 删除文件数: ${{ steps.extract-files.outputs.del_count }}
+          文件同步详情:
+          - 源仓库: ${{ github.event.inputs.source_repo }}
+          - 源分支: ${{ github.event.inputs.source_branch }}
+          - 处理提交数: ${{ steps.validate-commits.outputs.count }}
+          - 添加文件数: ${{ steps.extract-files.outputs.add_count }}
+          - 删除文件数: ${{ steps.extract-files.outputs.del_count }}
 
-处理的提交:
-$COMMITS_LIST
+          处理的提交:
+          $COMMITS_LIST
 
-${{ github.event.inputs.commit_message }}"
+          ${{ github.event.inputs.commit_message }}"
           
           echo "Commit message:"
           echo "$COMMIT_MESSAGE"
