@@ -1,4 +1,4 @@
-name: Repository Sync - Extract and Commit Files
+name: Repository File Sync
 
 on:
   workflow_dispatch:
@@ -26,11 +26,11 @@ on:
       commit_name:
         description: '自定义提交名称'
         required: true
-        default: 'mozi9: 文件同步'
+        default: 'mozi9: 同步文件'
       commit_message:
         description: '自定义提交信息'
         required: true
-        default: '从源仓库同步文件'
+        default: '从源仓库同步文件变更'
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -44,23 +44,28 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: ${{ github.event.inputs.target_repo }}
-        token: ${{ secrets.Mozi9_PAT }}
+        token: ${{ secrets.GITHUB_TOKEN || secrets.Mozi9_PAT }}
         ref: ${{ github.event.inputs.target_branch }}
         fetch-depth: 0
 
-    - name: Add source repository remote
+    - name: Clone source repository
       run: |
-        git remote add source-repo https://github.com/${{ github.event.inputs.source_repo }}.git
-        git fetch source-repo ${{ github.event.inputs.source_branch }}
+        echo "Cloning source repository..."
+        git clone https://${{ secrets.GITHUB_TOKEN || secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.source_repo }}.git /tmp/source-repo
+        cd /tmp/source-repo
+        git checkout ${{ github.event.inputs.source_branch }}
 
-    - name: Configure Git identity
+    - name: Setup Git identity
       run: |
-        git config --global user.name "mozi9"
-        git config --global user.email "mozi9"
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-    - name: Parse and validate commit hashes
-      id: parse-commits
+    - name: Validate source commits
+      id: validate-commits
       run: |
+        echo "Validating source commits..."
+        cd /tmp/source-repo
+        
         # Clean and split commit hashes
         CLEAN_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' '\n')
         VALID_COMMITS=""
@@ -70,14 +75,15 @@ jobs:
           if [ -n "$hash" ] && git rev-parse "$hash" >/dev/null 2>&1; then
             VALID_COMMITS="$VALID_COMMITS$hash"$'\n'
             COUNT=$((COUNT + 1))
-            echo "✅ Valid commit: $hash"
+            COMMIT_MSG=$(git log -1 --format="%s" "$hash" 2>/dev/null || echo "N/A")
+            echo "✅ Valid commit: $hash - $COMMIT_MSG"
           else
             echo "❌ Invalid commit: $hash"
           fi
         done
         
         if [ $COUNT -eq 0 ]; then
-          echo "No valid commits found"
+          echo "Error: No valid commits found"
           exit 1
         fi
         
@@ -85,140 +91,169 @@ jobs:
         echo "count=$COUNT" >> $GITHUB_OUTPUT
         echo "Found $COUNT valid commits"
 
-    - name: Analyze file changes from source commits
-      id: analyze-files
+    - name: Extract files from source commits
+      id: extract-files
       run: |
-        echo "Analyzing file changes from source commits..."
+        echo "Extracting files from source commits..."
+        cd /tmp/source-repo
         
-        # Initialize arrays
-        declare -A files_to_add
-        declare -A files_to_delete
+        # Create working directories
+        mkdir -p /tmp/workdir/extracted
         
-        # Read commits
+        # Initialize counters
+        ADD_COUNT=0
+        DEL_COUNT=0
+        
+        # Process each commit
         while IFS= read -r commit; do
           [ -z "$commit" ] && continue
-          echo "Analyzing commit: $commit"
+          echo "Processing commit: $commit"
           
-          # Get file changes
-          git show "$commit" --name-status --format= > /tmp/changes.txt 2>/dev/null || true
+          # Get all files in this commit
+          FILES_IN_COMMIT=$(git ls-tree -r --name-only "$commit" 2>/dev/null || true)
           
-          while IFS=$'\t' read -r status file1 file2; do
-            case "$status" in
-              A|M|C)  # Add/Modify/Copy
-                if [ -n "$file1" ]; then
-                  files_to_add["$file1"]=1
-                fi
-                if [ -n "$file2" ]; then
-                  files_to_add["$file2"]=1
-                fi
-                ;;
-              D)  # Delete
-                if [ -n "$file1" ]; then
-                  files_to_delete["$file1"]=1
-                fi
-                ;;
-              R)  # Rename
-                if [ -n "$file1" ]; then
-                  files_to_delete["$file1"]=1
-                fi
-                if [ -n "$file2" ]; then
-                  files_to_add["$file2"]=1
-                fi
-                ;;
-            esac
-          done < <(grep -v '^$' /tmp/changes.txt)
+          if [ -n "$FILES_IN_COMMIT" ]; then
+            for file in $FILES_IN_COMMIT; do
+              # Extract file content
+              if git show "$commit:$file" >/dev/null 2>&1; then
+                mkdir -p "/tmp/workdir/extracted/$(dirname "$file")"
+                git show "$commit:$file" > "/tmp/workdir/extracted/$file" 2>/dev/null || echo "Warning: Could not extract $file"
+                echo "$file" >> /tmp/workdir/files_to_add.txt
+                ADD_COUNT=$((ADD_COUNT + 1))
+                echo "📄 Extracted: $file"
+              fi
+            done
+          fi
+          
+          # Check for deleted files by comparing with parent
+          if git rev-parse "${commit}^" >/dev/null 2>&1; then
+            DELETED_FILES=$(git diff --name-only --diff-filter=D "${commit}^" "$commit" 2>/dev/null || true)
+            if [ -n "$DELETED_FILES" ]; then
+              for file in $DELETED_FILES; do
+                echo "$file" >> /tmp/workdir/files_to_delete.txt
+                DEL_COUNT=$((DEL_COUNT + 1))
+                echo "🗑️ Marked for deletion: $file"
+              done
+            fi
+          fi
+          
         done < /tmp/valid_commits.txt
         
-        # Save file lists
-        for file in "${!files_to_add[@]}"; do
-          echo "$file" >> /tmp/files_to_add.txt
-        done
-        
-        for file in "${!files_to_delete[@]}"; do
-          echo "$file" >> /tmp/files_to_delete.txt
-        done
-        
-        add_count=${#files_to_add[@]}
-        del_count=${#files_to_delete[@]}
-        
-        echo "add_count=$add_count" >> $GITHUB_OUTPUT
-        echo "del_count=$del_count" >> $GITHUB_OUTPUT
-        echo "Files to add: $add_count"
-        echo "Files to delete: $del_count"
-
-    - name: Copy new/modified files from source
-      run: |
-        echo "Copying files from source commits..."
-        
-        if [ ! -f "/tmp/files_to_add.txt" ]; then
-          echo "No files to add"
-          exit 0
+        # Remove duplicates from file lists
+        if [ -f "/tmp/workdir/files_to_add.txt" ]; then
+          sort -u /tmp/workdir/files_to_add.txt > /tmp/workdir/files_to_add_unique.txt
+          mv /tmp/workdir/files_to_add_unique.txt /tmp/workdir/files_to_add.txt
         fi
         
-        processed=0
-        while IFS= read -r file; do
-          [ -z "$file" ] && continue
-          
-          # Find which commit has this file
-          commit=$(grep -l "$file" /tmp/valid_commits.txt 2>/dev/null | head -1 || echo "")
-          if [ -z "$commit" ]; then
-            commit=$(head -1 /tmp/valid_commits.txt)
-          fi
-          
-          if git show "$commit:$file" >/dev/null 2>&1; then
-            mkdir -p "$(dirname "$file")"
-            git show "$commit:$file" > "$file"
-            processed=$((processed + 1))
-            echo "📄 Copied: $file"
-          fi
-        done < /tmp/files_to_add.txt
+        if [ -f "/tmp/workdir/files_to_delete.txt" ]; then
+          sort -u /tmp/workdir/files_to_delete.txt > /tmp/workdir/files_to_delete_unique.txt
+          mv /tmp/workdir/files_to_delete_unique.txt /tmp/workdir/files_to_delete.txt
+        fi
         
-        echo "Copied $processed files"
+        FINAL_ADD_COUNT=0
+        FINAL_DEL_COUNT=0
+        
+        if [ -f "/tmp/workdir/files_to_add.txt" ]; then
+          FINAL_ADD_COUNT=$(wc -l < /tmp/workdir/files_to_add.txt | tr -d ' ')
+        fi
+        
+        if [ -f "/tmp/workdir/files_to_delete.txt" ]; then
+          FINAL_DEL_COUNT=$(wc -l < /tmp/workdir/files_to_delete.txt | tr -d ' ')
+        fi
+        
+        echo "add_count=$FINAL_ADD_COUNT" >> $GITHUB_OUTPUT
+        echo "del_count=$FINAL_DEL_COUNT" >> $GITHUB_OUTPUT
+        echo "Extraction completed: $FINAL_ADD_COUNT files to add, $FINAL_DEL_COUNT files to delete"
 
-    - name: Delete files marked for removal
+    - name: Copy extracted files to target
       run: |
-        echo "Deleting files..."
+        echo "Copying extracted files to target repository..."
         
-        if [ ! -f "/tmp/files_to_delete.txt" ]; then
+        if [ -f "/tmp/workdir/files_to_add.txt" ] && [ -s "/tmp/workdir/files_to_add.txt" ]; then
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            
+            if [ -f "/tmp/workdir/extracted/$file" ]; then
+              # Create directory structure
+              mkdir -p "$(dirname "$file")"
+              # Copy file
+              cp "/tmp/workdir/extracted/$file" "$file"
+              echo "✅ Copied: $file"
+            else
+              echo "⚠️ Source file not found, skipping: $file"
+            fi
+          done < /tmp/workdir/files_to_add.txt
+          echo "Files copied successfully"
+        else
+          echo "No files to copy"
+        fi
+
+    - name: Delete marked files
+      run: |
+        echo "Deleting marked files..."
+        
+        if [ -f "/tmp/workdir/files_to_delete.txt" ] && [ -s "/tmp/workdir/files_to_delete.txt" ]; then
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            
+            if [ -f "$file" ] || [ -d "$file" ]; then
+              rm -rf "$file"
+              echo "🗑️ Deleted: $file"
+            else
+              echo "⚠️ File not found, skipping: $file"
+            fi
+          done < /tmp/workdir/files_to_delete.txt
+          echo "Deletion completed"
+        else
           echo "No files to delete"
-          exit 0
         fi
-        
-        deleted=0
-        while IFS= read -r file; do
-          [ -z "$file" ] && continue
-          
-          if [ -e "$file" ]; then
-            rm -rf "$file"
-            deleted=$((deleted + 1))
-            echo "🗑️ Deleted: $file"
-          fi
-        done < /tmp/files_to_delete.txt
-        
-        echo "Deleted $deleted files"
 
-    - name: Create commit with custom messages
+    - name: Create commit
       run: |
         echo "Creating commit..."
         
-        git add .
+        # Add all changes
+        git add -A
         
+        # Check if there are changes
         if git diff --cached --quiet; then
-          echo "No changes to commit"
+          echo "No changes detected, creating empty commit"
           git commit --allow-empty \
             -m "${{ github.event.inputs.commit_name }}" \
             -m "${{ github.event.inputs.commit_message }}" \
-            --author="mozi9 <mozi9>"
+            --author="github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
         else
-          git commit \
-            -m "${{ github.event.inputs.commit_name }}" \
-            -m "${{ github.event.inputs.commit_message }}" \
-            --author="mozi9 <mozi9>"
+          # Read valid commits for commit message
+          COMMITS_LIST=""
+          while IFS= read -r commit; do
+            [ -n "$commit" ] && COMMITS_LIST="$COMMITS_LIST  - $commit"$'\n'
+          done < /tmp/valid_commits.txt
+          
+          # Create commit message with proper formatting
+          COMMIT_MESSAGE="${{ github.event.inputs.commit_name }}
+
+文件同步详情:
+  - 源仓库: ${{ github.event.inputs.source_repo }}
+  - 源分支: ${{ github.event.inputs.source_branch }}
+  - 处理提交数: ${{ steps.validate-commits.outputs.count }}
+  - 添加文件数: ${{ steps.extract-files.outputs.add_count }}
+  - 删除文件数: ${{ steps.extract-files.outputs.del_count }}
+
+处理的提交:
+$COMMITS_LIST
+
+${{ github.event.inputs.commit_message }}"
+          
+          echo "Commit message:"
+          echo "$COMMIT_MESSAGE"
+          echo "---"
+          
+          git commit -m "$COMMIT_MESSAGE" --author="github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
         fi
         
         echo "✅ Commit created"
 
-    - name: Push changes to target repository
+    - name: Push to target repository
       run: |
         echo "Pushing to target repository..."
         git push origin ${{ github.event.inputs.target_branch }}
@@ -226,14 +261,21 @@ jobs:
 
     - name: Generate summary
       run: |
-        echo "🎉 Sync completed successfully!"
+        echo "🎉 File sync completed successfully!"
         echo "========================================"
         echo "Summary:"
-        echo "📋 Source commits: ${{ steps.parse-commits.outputs.count }}"
-        echo "📦 Files added: ${{ steps.analyze-files.outputs.add_count }}"
-        echo "🗑️ Files deleted: ${{ steps.analyze-files.outputs.del_count }}"
-        echo "👤 Commit author: mozi9"
-        echo "📝 Commit name: ${{ github.event.inputs.commit_name }}"
-        echo "🔗 Target repo: ${{ github.event.inputs.target_repo }}"
-        echo "🌿 Target branch: ${{ github.event.inputs.target_branch }}"
+        echo "  Source repository: ${{ github.event.inputs.source_repo }}"
+        echo "  Source branch: ${{ github.event.inputs.source_branch }}"
+        echo "  Target repository: ${{ github.event.inputs.target_repo }}"
+        echo "  Target branch: ${{ github.event.inputs.target_branch }}"
+        echo "  Commits processed: ${{ steps.validate-commits.outputs.count }}"
+        echo "  Files added: ${{ steps.extract-files.outputs.add_count }}"
+        echo "  Files deleted: ${{ steps.extract-files.outputs.del_count }}"
+        echo "  Commit author: github-actions[bot]"
+        echo "  Commit message: ${{ github.event.inputs.commit_name }}"
+        echo ""
+        echo "Processed commits:"
+        cat /tmp/valid_commits.txt | while read commit; do
+          [ -n "$commit" ] && echo "  - $commit"
+        done
         echo "========================================"
