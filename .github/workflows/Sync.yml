@@ -1,0 +1,241 @@
+name: Manual Repository Sync - Extract and Pack Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'owner/source-repo'
+      target_repo:
+        description: '目标仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'owner/target-repo'
+      source_branch:
+        description: '源分支名'
+        required: true
+        default: 'main'
+      target_branch:
+        description: '目标分支名'
+        required: true
+        default: 'main'
+      commit_hashes:
+        description: '要同步的提交哈希（多个用逗号分隔）'
+        required: true
+        default: '75fef37dde7c3cbcde63ae7542f115fb04d9ee70,fa957cbe93c6260f4968cf3d01ec3974bcd49ff8'
+      commit_name:
+        description: '自定义提交名称'
+        required: true
+        default: 'mozi9: 同步文件包'
+      commit_message:
+        description: '自定义提交信息'
+        required: true
+        default: '从源仓库提取并打包文件'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync-repository:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ secrets.Mozi9_PAT }}
+        ref: ${{ github.event.inputs.target_branch }}
+        fetch-depth: 0
+
+    - name: Add source repository as remote
+      run: |
+        git remote add source-repo https://github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source-repo ${{ github.event.inputs.source_branch }}
+
+    - name: Setup Git config for Mozi9
+      run: |
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
+
+    - name: Parse commit hashes
+      id: parse_commits
+      run: |
+        # 清理和验证提交哈希
+        CLEAN_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' '\n' | grep -v '^$')
+        
+        VALID_COMMITS=""
+        COMMIT_COUNT=0
+        
+        for hash in $CLEAN_HASHES; do
+          if git rev-parse $hash >/dev/null 2>&1; then
+            VALID_COMMITS="$VALID_COMMITS$hash"$'\n'
+            COMMIT_COUNT=$((COMMIT_COUNT + 1))
+            echo "✅ 提交有效: $hash"
+          else
+            echo "❌ 提交无效: $hash"
+          fi
+        done
+        
+        if [ $COMMIT_COUNT -eq 0 ]; then
+          echo "错误: 没有找到有效的提交哈希"
+          exit 1
+        fi
+        
+        echo "$VALID_COMMITS" > /tmp/valid_commits.txt
+        echo "找到 $COMMIT_COUNT 个有效提交"
+        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+
+    - name: Extract files from commits
+      id: extract_files
+      run: |
+        mkdir -p /tmp/extracted_files
+        COMMITS=$(cat /tmp/valid_commits.txt)
+        
+        # 用于跟踪文件内容和路径
+        declare -A file_checksums
+        declare -A deleted_files
+        
+        echo "开始从提交中提取文件..."
+        
+        for COMMIT in $COMMITS; do
+          echo "处理提交: $COMMIT"
+          
+          # 获取提交的文件变更
+          git show $COMMIT --name-status --format= > /tmp/commit_changes.txt 2>/dev/null || true
+          
+          # 处理文件变更
+          while IFS=$'\t' read -r status file1 file2; do
+            case "$status" in
+              A|M|C)  # 新增、修改、复制
+                if [ -n "$file1" ]; then
+                  # 提取文件内容
+                  if git show $COMMIT:"$file1" >/dev/null 2>&1; then
+                    FILE_CONTENT=$(git show $COMMIT:"$file1")
+                    CHECKSUM=$(echo "$FILE_CONTENT" | sha1sum | cut -d' ' -f1)
+                    
+                    # 如果checksum不存在，则保存文件
+                    if [ -z "${file_checksums[$CHECKSUM]}" ]; then
+                      mkdir -p "/tmp/extracted_files/$(dirname "$file1")"
+                      echo "$FILE_CONTENT" > "/tmp/extracted_files/$file1"
+                      file_checksums[$CHECKSUM]="$file1"
+                      echo "📄 提取文件: $file1"
+                    else
+                      echo "🔁 跳过重复文件: $file1 (与 ${file_checksums[$CHECKSUM]} 相同)"
+                    fi
+                  fi
+                fi
+                ;;
+              D)  # 删除
+                if [ -n "$file1" ]; then
+                  deleted_files["$file1"]=1
+                  echo "🗑️ 标记删除: $file1"
+                fi
+                ;;
+              R)  # 重命名
+                if [ -n "$file1" ] && [ -n "$file2" ]; then
+                  deleted_files["$file1"]=1
+                  echo "🔄 重命名: $file1 -> $file2"
+                  # 同时处理新文件
+                  if git show $COMMIT:"$file2" >/dev/null 2>&1; then
+                    FILE_CONTENT=$(git show $COMMIT:"$file2")
+                    CHECKSUM=$(echo "$FILE_CONTENT" | sha1sum | cut -d' ' -f1)
+                    
+                    if [ -z "${file_checksums[$CHECKSUM]}" ]; then
+                      mkdir -p "/tmp/extracted_files/$(dirname "$file2")"
+                      echo "$FILE_CONTENT" > "/tmp/extracted_files/$file2"
+                      file_checksums[$CHECKSUM]="$file2"
+                      echo "📄 提取重命名文件: $file2"
+                    fi
+                  fi
+                fi
+                ;;
+            esac
+          done < <(grep -v '^$' /tmp/commit_changes.txt | sed 's/^[ \t]*//;s/[ \t]*$//')
+        done
+        
+        # 保存删除文件列表
+        for file in "${!deleted_files[@]}"; do
+          echo "$file" >> /tmp/deleted_files.txt
+        done
+        
+        EXTRACTED_COUNT=$(find /tmp/extracted_files -type f | wc -l)
+        DELETED_COUNT=${#deleted_files[@]}
+        
+        echo "文件提取完成:"
+        echo "📊 提取文件数: $EXTRACTED_COUNT"
+        echo "📊 删除文件数: $DELETED_COUNT"
+        
+        echo "extracted_count=$EXTRACTED_COUNT" >> $GITHUB_OUTPUT
+        echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+
+    - name: Copy files to target repository
+      run: |
+        echo "复制文件到目标仓库..."
+        
+        # 复制提取的文件
+        if [ -d "/tmp/extracted_files" ]; then
+          cp -r /tmp/extracted_files/* . 2>/dev/null || true
+          cp -r /tmp/extracted_files/.* . 2>/dev/null || true
+        fi
+        
+        # 清理.git目录
+        rm -rf .git 2>/dev/null || true
+        
+        echo "文件复制完成"
+
+    - name: Delete marked files
+      run: |
+        echo "处理删除的文件..."
+        
+        if [ -f "/tmp/deleted_files.txt" ]; then
+          while IFS= read -r file; do
+            if [ -n "$file" ] && { [ -f "$file" ] || [ -d "$file" ]; }; then
+              echo "删除文件: $file"
+              rm -rf "$file"
+            fi
+          done < /tmp/deleted_files.txt
+        fi
+        
+        echo "删除操作完成"
+
+    - name: Create commit with custom message
+      run: |
+        echo "创建提交..."
+        
+        git add .
+        
+        if git diff --cached --quiet; then
+          echo "没有文件变更，创建空提交"
+          git commit --allow-empty -m "${{ github.event.inputs.commit_name }}" -m "${{ github.event.inputs.commit_message }}" --author="mozi9 <mozi9>"
+        else
+          git commit -m "${{ github.event.inputs.commit_name }}" -m "${{ github.event.inputs.commit_message }}" --author="mozi9 <mozi9>"
+        fi
+        
+        echo "✅ 提交创建完成"
+
+    - name: Push to target repository
+      run: |
+        echo "推送到目标仓库..."
+        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+        echo "✅ 推送完成"
+
+    - name: Create summary
+      run: |
+        echo "🎉 同步完成！"
+        echo "========================================"
+        echo "处理统计:"
+        echo "📋 源提交数量: ${{ steps.parse_commits.outputs.commit_count }}"
+        echo "📦 提取文件数: ${{ steps.extract_files.outputs.extracted_count }}"
+        echo "🗑️ 删除文件数: ${{ steps.extract_files.outputs.deleted_count }}"
+        echo "👤 提交作者: mozi9"
+        echo "📝 提交名称: ${{ github.event.inputs.commit_name }}"
+        echo "📖 提交信息: ${{ github.event.inputs.commit_message }}"
+        echo "🎯 目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "🌿 目标分支: ${{ github.event.inputs.target_branch }}"
+        echo ""
+        echo "处理的提交:"
+        cat /tmp/valid_commits.txt | while read commit; do
+          [ -n "$commit" ] && echo "  - $commit"
+        done
+        echo "========================================"
+
