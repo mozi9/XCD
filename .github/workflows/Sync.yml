@@ -85,130 +85,166 @@ jobs:
         echo "找到 $COMMIT_COUNT 个有效提交"
         echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
 
-    - name: Extract files from commits
-      id: extract_files
+    - name: Analyze file changes from source commits
+      id: analyze_files
       run: |
-        mkdir -p /tmp/extracted_files
         COMMITS=$(cat /tmp/valid_commits.txt)
         
-        # 用于跟踪文件内容和路径
-        declare -A file_checksums
-        declare -A deleted_files
+        # 用于跟踪文件操作
+        declare -A files_to_add
+        declare -A files_to_delete
         
-        echo "开始从提交中提取文件..."
+        echo "分析源提交中的文件变更..."
         
         for COMMIT in $COMMITS; do
-          echo "处理提交: $COMMIT"
+          echo "分析提交: $COMMIT"
           
-          # 获取提交的文件变更
+          # 获取提交的文件变更状态
           git show $COMMIT --name-status --format= > /tmp/commit_changes.txt 2>/dev/null || true
           
           # 处理文件变更
           while IFS=$'\t' read -r status file1 file2; do
             case "$status" in
-              A|M|C)  # 新增、修改、复制
+              A|M|C)  # 新增、修改、复制 - 需要添加的文件
                 if [ -n "$file1" ]; then
-                  # 提取文件内容
-                  if git show $COMMIT:"$file1" >/dev/null 2>&1; then
-                    FILE_CONTENT=$(git show $COMMIT:"$file1")
-                    CHECKSUM=$(echo "$FILE_CONTENT" | sha1sum | cut -d' ' -f1)
-                    
-                    # 如果checksum不存在，则保存文件
-                    if [ -z "${file_checksums[$CHECKSUM]}" ]; then
-                      mkdir -p "/tmp/extracted_files/$(dirname "$file1")"
-                      echo "$FILE_CONTENT" > "/tmp/extracted_files/$file1"
-                      file_checksums[$CHECKSUM]="$file1"
-                      echo "📄 提取文件: $file1"
-                    else
-                      echo "🔁 跳过重复文件: $file1 (与 ${file_checksums[$CHECKSUM]} 相同)"
-                    fi
-                  fi
+                  files_to_add["$file1"]="$COMMIT"
+                  echo "📄 需要添加: $file1"
+                fi
+                if [ -n "$file2" ]; then  # 复制或重命名的新文件
+                  files_to_add["$file2"]="$COMMIT"
+                  echo "📄 需要添加: $file2"
                 fi
                 ;;
-              D)  # 删除
+              D)  # 删除 - 需要删除的文件
                 if [ -n "$file1" ]; then
-                  deleted_files["$file1"]=1
-                  echo "🗑️ 标记删除: $file1"
+                  files_to_delete["$file1"]="$COMMIT"
+                  echo "🗑️ 需要删除: $file1"
                 fi
                 ;;
               R)  # 重命名
-                if [ -n "$file1" ] && [ -n "$file2" ]; then
-                  deleted_files["$file1"]=1
-                  echo "🔄 重命名: $file1 -> $file2"
-                  # 同时处理新文件
-                  if git show $COMMIT:"$file2" >/dev/null 2>&1; then
-                    FILE_CONTENT=$(git show $COMMIT:"$file2")
-                    CHECKSUM=$(echo "$FILE_CONTENT" | sha1sum | cut -d' ' -f1)
-                    
-                    if [ -z "${file_checksums[$CHECKSUM]}" ]; then
-                      mkdir -p "/tmp/extracted_files/$(dirname "$file2")"
-                      echo "$FILE_CONTENT" > "/tmp/extracted_files/$file2"
-                      file_checksums[$CHECKSUM]="$file2"
-                      echo "📄 提取重命名文件: $file2"
-                    fi
-                  fi
+                if [ -n "$file1" ]; then
+                  files_to_delete["$file1"]="$COMMIT"  # 原文件删除
+                  echo "🗑️ 需要删除(重命名): $file1"
+                fi
+                if [ -n "$file2" ]; then
+                  files_to_add["$file2"]="$COMMIT"  # 新文件添加
+                  echo "📄 需要添加(重命名): $file2"
                 fi
                 ;;
             esac
           done < <(grep -v '^$' /tmp/commit_changes.txt | sed 's/^[ \t]*//;s/[ \t]*$//')
         done
         
-        # 保存删除文件列表
-        for file in "${!deleted_files[@]}"; do
-          echo "$file" >> /tmp/deleted_files.txt
+        # 保存需要添加的文件列表
+        for file in "${!files_to_add[@]}"; do
+          echo "$file" >> /tmp/files_to_add.txt
         done
         
-        EXTRACTED_COUNT=$(find /tmp/extracted_files -type f | wc -l)
-        DELETED_COUNT=${#deleted_files[@]}
+        # 保存需要删除的文件列表
+        for file in "${!files_to_delete[@]}"; do
+          echo "$file" >> /tmp/files_to_delete.txt
+        done
         
-        echo "文件提取完成:"
-        echo "📊 提取文件数: $EXTRACTED_COUNT"
-        echo "📊 删除文件数: $DELETED_COUNT"
+        ADD_COUNT=${#files_to_add[@]}
+        DELETE_COUNT=${#files_to_delete[@]}
         
-        echo "extracted_count=$EXTRACTED_COUNT" >> $GITHUB_OUTPUT
-        echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+        echo "文件分析完成:"
+        echo "📊 需要添加的文件数: $ADD_COUNT"
+        echo "📊 需要删除的文件数: $DELETE_COUNT"
+        
+        echo "add_count=$ADD_COUNT" >> $GITHUB_OUTPUT
+        echo "delete_count=$DELETE_COUNT" >> $GITHUB_OUTPUT
 
-    - name: Copy files to target repository
+    - name: Copy files from source commits
       run: |
-        echo "复制文件到目标仓库..."
+        echo "从源提交复制文件到目标仓库..."
         
-        # 复制提取的文件
-        if [ -d "/tmp/extracted_files" ]; then
-          cp -r /tmp/extracted_files/* . 2>/dev/null || true
-          cp -r /tmp/extracted_files/.* . 2>/dev/null || true
+        if [ ! -f "/tmp/files_to_add.txt" ] || [ ! -s "/tmp/files_to_add.txt" ]; then
+          echo "没有需要添加的文件"
+          exit 0
         fi
         
-        # 清理.git目录
-        rm -rf .git 2>/dev/null || true
+        ADD_COUNT=0
+        while IFS= read -r file; do
+          if [ -z "$file" ]; then
+            continue
+          fi
+          
+          # 从最后一个包含该文件的提交中获取文件
+          COMMIT=$(git log --oneline -1 --format=%H -- "$file" source-repo/${{ github.event.inputs.source_branch }} 2>/dev/null || echo "")
+          
+          if [ -n "$COMMIT" ] && git show $COMMIT:"$file" >/dev/null 2>&1; then
+            # 创建目录
+            mkdir -p "$(dirname "$file")"
+            # 复制文件
+            git show $COMMIT:"$file" > "$file"
+            ADD_COUNT=$((ADD_COUNT + 1))
+            echo "✅ 复制文件: $file"
+          else
+            echo "❌ 无法获取文件: $file"
+          fi
+        done < /tmp/files_to_add.txt
         
-        echo "文件复制完成"
+        echo "文件复制完成: 成功复制 $ADD_COUNT 个文件"
 
-    - name: Delete marked files
+    - name: Delete files marked for deletion
       run: |
-        echo "处理删除的文件..."
+        echo "删除源提交中标记为删除的文件..."
         
-        if [ -f "/tmp/deleted_files.txt" ]; then
-          while IFS= read -r file; do
-            if [ -n "$file" ] && { [ -f "$file" ] || [ -d "$file" ]; }; then
-              echo "删除文件: $file"
-              rm -rf "$file"
-            fi
-          done < /tmp/deleted_files.txt
+        if [ ! -f "/tmp/files_to_delete.txt" ] || [ ! -s "/tmp/files_to_delete.txt" ]; then
+          echo "没有需要删除的文件"
+          exit 0
         fi
         
-        echo "删除操作完成"
+        DELETE_COUNT=0
+        while IFS= read -r file; do
+          if [ -z "$file" ]; then
+            continue
+          fi
+          
+          if [ -f "$file" ] || [ -d "$file" ]; then
+            rm -rf "$file"
+            DELETE_COUNT=$((DELETE_COUNT + 1))
+            echo "✅ 删除文件: $file"
+          else
+            echo "⚠️ 文件不存在，跳过删除: $file"
+          fi
+        done < /tmp/files_to_delete.txt
+        
+        echo "删除完成: 实际删除 $DELETE_COUNT 个文件"
 
     - name: Create commit with custom message
       run: |
         echo "创建提交..."
         
+        # 添加所有变更到暂存区
         git add .
         
+        # 检查是否有变更
         if git diff --cached --quiet; then
           echo "没有文件变更，创建空提交"
-          git commit --allow-empty -m "${{ github.event.inputs.commit_name }}" -m "${{ github.event.inputs.commit_message }}" --author="mozi9 <mozi9>"
+          git commit --allow-empty \
+            -m "${{ github.event.inputs.commit_name }}" \
+            -m "${{ github.event.inputs.commit_message }}" \
+            --author="mozi9 <mozi9>"
         else
-          git commit -m "${{ github.event.inputs.commit_name }}" -m "${{ github.event.inputs.commit_message }}" --author="mozi9 <mozi9>"
+          # 创建详细的提交信息
+          COMMIT_BODY="文件变更详情:
+- 添加文件: ${{ steps.analyze_files.outputs.add_count }} 个
+- 删除文件: ${{ steps.analyze_files.outputs.delete_count }} 个
+- 源提交数量: ${{ steps.parse_commits.outputs.commit_count }}
+
+源提交列表:
+$(cat /tmp/valid_commits.txt | while read commit; do 
+  [ -n "$commit" ] && echo "  - $commit"; 
+done)
+
+${{ github.event.inputs.commit_message }}"
+          
+          git commit \
+            -m "${{ github.event.inputs.commit_name }}" \
+            -m "$COMMIT_BODY" \
+            --author="mozi9 <mozi9>"
         fi
         
         echo "✅ 提交创建完成"
@@ -216,7 +252,7 @@ jobs:
     - name: Push to target repository
       run: |
         echo "推送到目标仓库..."
-        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+        git push origin ${{ github.event.inputs.target_branch }}
         echo "✅ 推送完成"
 
     - name: Create summary
@@ -225,17 +261,17 @@ jobs:
         echo "========================================"
         echo "处理统计:"
         echo "📋 源提交数量: ${{ steps.parse_commits.outputs.commit_count }}"
-        echo "📦 提取文件数: ${{ steps.extract_files.outputs.extracted_count }}"
-        echo "🗑️ 删除文件数: ${{ steps.extract_files.outputs.deleted_count }}"
+        echo "📦 添加文件数: ${{ steps.analyze_files.outputs.add_count }}"
+        echo "🗑️ 删除文件数: ${{ steps.analyze_files.outputs.delete_count }}"
         echo "👤 提交作者: mozi9"
         echo "📝 提交名称: ${{ github.event.inputs.commit_name }}"
         echo "📖 提交信息: ${{ github.event.inputs.commit_message }}"
         echo "🎯 目标仓库: ${{ github.event.inputs.target_repo }}"
         echo "🌿 目标分支: ${{ github.event.inputs.target_branch }}"
         echo ""
-        echo "处理的提交:"
-        cat /tmp/valid_commits.txt | while read commit; do
-          [ -n "$commit" ] && echo "  - $commit"
-        done
+        echo "添加的文件:"
+        cat /tmp/files_to_add.txt 2>/dev/null | head -10 | sed 's/^/  - /' || echo "  - 无"
+        echo ""
+        echo "删除的文件:"
+        cat /tmp/files_to_delete.txt 2>/dev/null | head -10 | sed 's/^/  - /' || echo "  - 无"
         echo "========================================"
-
