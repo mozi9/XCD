@@ -4,17 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址 (格式: owner/repo 或完整URL)'
+        description: '源仓库地址 (格式: owner/repo 或完整URL，带tree/表示已有分支)'
         required: true
-        default: 'owner/source-repo'
-      source_commit:
-        description: '源提交 (分支名、标签、短哈希或完整哈希)'
-        required: true
-        default: 'main'
+        default: 'https://github.com/owner/source-repo'
+      source_ref:
+        description: '源引用 (分支名、标签、短哈希或完整哈希，如果URL中已包含分支则留空)'
+        required: false
+        default: ''
       target_repo:
-        description: '目标仓库地址 (格式: owner/repo 或完整URL)'
+        description: '目标仓库地址 (格式: owner/repo 或完整URL，带tree/表示已有分支)'
         required: true
-        default: 'owner/target-repo'
+        default: 'https://github.com/owner/target-repo'
+      target_branch:
+        description: '目标分支名 (如果URL中已包含分支则留空)'
+        required: false
+        default: ''
       commit_name:
         description: '提交显示名称'
         required: true
@@ -42,10 +46,65 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+    - name: Parse repository URLs and references
+      id: parse_urls
+      run: |
+        # 解析源仓库信息
+        SOURCE_URL="${{ github.event.inputs.source_repo }}"
+        if [[ $SOURCE_URL == http* ]]; then
+          # 从完整URL中提取owner/repo
+          if [[ $SOURCE_URL == *"github.com"* ]]; then
+            SOURCE_REPO=$(echo "$SOURCE_URL" | sed -n 's|.*github.com/\([^/]*/[^/?]*\).*|\1|p')
+            # 检查是否包含tree/（分支信息）
+            if [[ $SOURCE_URL == *"tree/"* ]]; then
+              SOURCE_BRANCH=$(echo "$SOURCE_URL" | sed -n 's|.*tree/\([^/?]*\).*|\1|p')
+            else
+              SOURCE_BRANCH="${{ github.event.inputs.source_ref || 'main' }}"
+            fi
+          else
+            echo "错误：不支持的仓库地址格式"
+            exit 1
+          fi
+        else
+          SOURCE_REPO="$SOURCE_URL"
+          SOURCE_BRANCH="${{ github.event.inputs.source_ref || 'main' }}"
+        fi
+        
+        # 解析目标仓库信息
+        TARGET_URL="${{ github.event.inputs.target_repo }}"
+        if [[ $TARGET_URL == http* ]]; then
+          # 从完整URL中提取owner/repo
+          if [[ $TARGET_URL == *"github.com"* ]]; then
+            TARGET_REPO=$(echo "$TARGET_URL" | sed -n 's|.*github.com/\([^/]*/[^/?]*\).*|\1|p')
+            # 检查是否包含tree/（分支信息）
+            if [[ $TARGET_URL == *"tree/"* ]]; then
+              TARGET_BRANCH=$(echo "$TARGET_URL" | sed -n 's|.*tree/\([^/?]*\).*|\1|p')
+            else
+              TARGET_BRANCH="${{ github.event.inputs.target_branch || 'main' }}"
+            fi
+          else
+            echo "错误：不支持的仓库地址格式"
+            exit 1
+          fi
+        else
+          TARGET_REPO="$TARGET_URL"
+          TARGET_BRANCH="${{ github.event.inputs.target_branch || 'main' }}"
+        fi
+        
+        echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
+        echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
+        echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
+        echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+        
+        echo "解析结果："
+        echo "源仓库: $SOURCE_REPO, 分支: $SOURCE_BRANCH"
+        echo "目标仓库: $TARGET_REPO, 分支: $TARGET_BRANCH"
+        
     - name: Checkout target repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.event.inputs.target_repo }}
+        repository: ${{ steps.parse_urls.outputs.target_repo }}
+        ref: ${{ steps.parse_urls.outputs.target_branch }}
         token: ${{ env.PAT }}
         fetch-depth: 0
         
@@ -57,17 +116,28 @@ jobs:
         
     - name: Add source repository as remote
       run: |
-        git remote add source https://${{ env.PAT }}@github.com/${{ github.event.inputs.source_repo }}.git
+        git remote add source https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.source_repo }}.git
         git fetch source --depth=1
         
     - name: Get full commit hash from source
       id: get_hash
       run: |
+        SOURCE_REF="${{ github.event.inputs.source_ref || steps.parse_urls.outputs.source_branch }}"
+        
         if [ "${{ github.event.inputs.use_full_hash }}" = "true" ]; then
-          FULL_HASH="${{ github.event.inputs.source_commit }}"
+          FULL_HASH="$SOURCE_REF"
         else
-          FULL_HASH=$(git rev-parse source/${{ github.event.inputs.source_commit }})
+          # 尝试解析引用（可能是分支、标签或哈希）
+          if git show-ref --verify --quiet refs/remotes/source/$SOURCE_REF; then
+            FULL_HASH=$(git rev-parse source/$SOURCE_REF)
+          elif git rev-parse --verify --quiet $SOURCE_REF; then
+            FULL_HASH=$(git rev-parse $SOURCE_REF)
+          else
+            # 尝试直接获取提交
+            FULL_HASH=$(git rev-parse $SOURCE_REF)
+          fi
         fi
+        
         echo "full_hash=$FULL_HASH" >> $GITHUB_OUTPUT
         echo "Resolved commit hash: $FULL_HASH"
         
@@ -90,13 +160,21 @@ jobs:
         
     - name: Force push to target repository
       run: |
-        git push --force origin HEAD:main
+        git push --force origin HEAD:${{ steps.parse_urls.outputs.target_branch }}
         
     - name: Create annotated tag for the sync operation
       run: |
-        git tag -a "sync-${{ steps.get_hash.outputs.full_hash }}" -m "${{ github.event.inputs.commit_message }}"
-        git push origin "sync-${{ steps.get_hash.outputs.full_hash }}"
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        git tag -a "sync-$TIMESTAMP-${{ steps.get_hash.outputs.full_hash }}" -m "${{ github.event.inputs.commit_message }}"
+        git push origin "sync-$TIMESTAMP-${{ steps.get_hash.outputs.full_hash }}"
         
     - name: Cleanup
       run: |
         git remote remove source
+        
+    - name: Display sync summary
+      run: |
+        echo "同步完成！"
+        echo "源仓库: ${{ steps.parse_urls.outputs.source_repo }} (${{ steps.get_hash.outputs.full_hash }})"
+        echo "目标仓库: ${{ steps.parse_urls.outputs.target_repo }} (${{ steps.parse_urls.outputs.target_branch }})"
+        echo "提交信息: ${{ github.event.inputs.commit_message }}"
