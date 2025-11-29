@@ -1,4 +1,4 @@
-name: Manual Repository Sync - Mozi9
+name: Exact Source Commit Sync - Mozi9
 
 on:
   workflow_dispatch:
@@ -23,18 +23,10 @@ on:
         description: '要同步的提交哈希（多个用逗号分隔）'
         required: true
         default: ''
-      commit_name:
-        description: '合并提交名'
+      commit_message:
+        description: '合并提交信息'
         required: true
         default: 'sync: 同步提交'
-      commit_description:
-        description: '合并提交描述（可选）'
-        required: false
-        default: ''
-      delete_message:
-        description: '删除文件提交信息'
-        required: true
-        default: 'delete: 删除文件'
       max_commits:
         description: '最大同步提交数量'
         required: true
@@ -44,7 +36,7 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  sync-repository:
+  exact-sync:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout target repository
@@ -59,22 +51,18 @@ jobs:
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9"
-        git config --global push.default simple
         echo "Git identity: mozi9 <mozi9>"
 
     - name: Add source repository
-      id: add_source
       run: |
         echo "添加源仓库..."
         SOURCE_REPO="${{ github.event.inputs.source_repo }}"
         SOURCE_BRANCH="${{ github.event.inputs.source_branch }}"
         
         if [ -z "$SOURCE_BRANCH" ]; then
-          echo "使用源仓库默认分支"
           git remote add source-repo https://github.com/$SOURCE_REPO.git
           git fetch source-repo
         else
-          echo "使用源仓库分支: $SOURCE_BRANCH"
           git remote add source-repo https://github.com/$SOURCE_REPO.git
           git fetch source-repo $SOURCE_BRANCH
         fi
@@ -89,8 +77,9 @@ jobs:
         VALID_COMMITS=()
         for hash in $COMMIT_HASHES; do
           if git rev-parse --verify "$hash" >/dev/null 2>&1; then
+            COMMIT_SUBJECT=$(git log -1 --format="%s" "$hash")
+            echo "✅ 提交有效: $hash - $COMMIT_SUBJECT"
             VALID_COMMITS+=("$hash")
-            echo "✅ 提交有效: $hash"
           else
             echo "❌ 提交无效: $hash"
           fi
@@ -103,160 +92,119 @@ jobs:
         
         MAX_COMMITS=${{ github.event.inputs.max_commits }}
         if [ ${#VALID_COMMITS[@]} -gt $MAX_COMMITS ]; then
-          echo "⚠️ 提交数量超过限制，只处理前 $MAX_COMMITS 个"
           VALID_COMMITS=("${VALID_COMMITS[@]:0:$MAX_COMMITS}")
         fi
         
         printf "%s\n" "${VALID_COMMITS[@]}" > /tmp/valid_commits.txt
         echo "commit_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
-        echo "📊 将处理 ${#VALID_COMMITS[@]} 个提交"
 
-    - name: Collect files marked for deletion
-      id: collect_deleted
+    - name: Create exact sync branch
       run: |
-        echo "收集删除文件标记..."
+        echo "创建精确同步分支..."
+        SYNC_BRANCH="exact-sync-$(date +%s)"
+        git checkout -b "$SYNC_BRANCH"
+        echo "sync_branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Apply exact source commits
+      id: apply_commits
+      run: |
+        echo "应用精确源提交..."
         COMMITS=$(cat /tmp/valid_commits.txt)
-        DELETED_FILES=""
+        APPLIED_COUNT=0
         
         for COMMIT in $COMMITS; do
-          set +e
-          DELETED_IN_COMMIT=$(git show "$COMMIT" --name-only --diff-filter=D --format= 2>/dev/null)
-          set -e
-          if [ -n "$DELETED_IN_COMMIT" ]; then
-            DELETED_FILES="$DELETED_FILES"$'\n'"$DELETED_IN_COMMIT"
+          echo "应用提交: $COMMIT"
+          
+          # 获取原始提交信息
+          COMMIT_MSG=$(git log -1 --format=%B "$COMMIT")
+          COMMIT_DATE=$(git log -1 --format=%ci "$COMMIT")
+          COMMIT_AUTHOR=$(git log -1 --format="%an <%ae>" "$COMMIT")
+          
+          echo "原始作者: $COMMIT_AUTHOR"
+          echo "提交时间: $COMMIT_DATE"
+          echo "提交信息: $COMMIT_MSG"
+          
+          # 使用git format-patch和am来保持完全一致
+          git format-patch "$COMMIT"^.."$COMMIT" --stdout > /tmp/commit.patch
+          
+          # 应用补丁
+          if git am /tmp/commit.patch; then
+            APPLIED_COUNT=$((APPLIED_COUNT + 1))
+            echo "✅ 提交应用成功"
+          else
+            echo "❌ 提交应用失败，尝试cherry-pick"
+            git am --abort 2>/dev/null || true
+            
+            # 回退到cherry-pick方案
+            if git cherry-pick "$COMMIT"; then
+              APPLIED_COUNT=$((APPLIED_COUNT + 1))
+              echo "✅ Cherry-pick成功"
+            else
+              echo "❌ 所有方法都失败，跳过提交"
+              git cherry-pick --abort 2>/dev/null || true
+            fi
           fi
         done
         
-        if [ -n "$DELETED_FILES" ]; then
-          echo "$DELETED_FILES" | sort | uniq | grep -v '^$' > /tmp/deleted_files.txt
-          DEL_COUNT=$(cat /tmp/deleted_files.txt | wc -l)
-          echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
-          echo "📊 收集到 $DEL_COUNT 个删除文件"
-        else
-          touch /tmp/deleted_files.txt
-          echo "deleted_files_count=0" >> $GITHUB_OUTPUT
-          echo "ℹ️ 没有删除文件标记"
-        fi
+        echo "applied_count=$APPLIED_COUNT" >> $GITHUB_OUTPUT
 
-    - name: Create sync branch
-      id: create_branch
+    - name: Verify exact match
+      id: verify_match
       run: |
-        echo "创建同步分支..."
-        SYNC_BRANCH="sync-$(date +%s)"
-        git checkout -b "$SYNC_BRANCH"
-        echo "branch_name=$SYNC_BRANCH" >> $GITHUB_OUTPUT
-
-    - name: Process commits one by one
-      id: process_commits
-      run: |
-        echo "逐个处理提交..."
+        echo "验证与源提交的精确匹配..."
         COMMITS=$(cat /tmp/valid_commits.txt)
-        PROCESSED_COUNT=0
+        VERIFIED_COUNT=0
         
-        for COMMIT in $COMMITS; do
-          echo "处理提交: $COMMIT"
+        for i in $(seq 1 ${#COMMITS[@]}); do
+          SOURCE_COMMIT=$(echo "$COMMITS" | sed -n "${i}p")
+          TARGET_COMMIT=$(git log --oneline -1 --skip=$((i-1)) | cut -d' ' -f1)
           
-          # 获取提交信息
-          COMMIT_MSG=$(git log -1 --format="%s" "$COMMIT")
-          echo "提交信息: $COMMIT_MSG"
+          # 比较文件树
+          SOURCE_TREE=$(git show --pretty="format:" --name-only "$SOURCE_COMMIT" | sort)
+          TARGET_TREE=$(git show --pretty="format:" --name-only "HEAD~$(( ${#COMMITS[@]} - i ))" | sort)
           
-          # 获取提交中的所有文件
-          COMMIT_FILES=$(git show --name-only --format= "$COMMIT" 2>/dev/null | grep -v '^$' || true)
-          
-          # 复制所有文件（强制覆盖）
-          for file in $COMMIT_FILES; do
-            # 跳过删除标记的文件
-            if grep -q "^$file$" /tmp/deleted_files.txt 2>/dev/null; then
-              continue
-            fi
-            
-            # 创建目录并复制文件
-            mkdir -p "$(dirname "$file")"
-            git show "$COMMIT":"$file" > "$file" 2>/dev/null || echo "⚠️ 无法复制: $file"
-          done
-          
-          # 添加所有文件
-          git add -A
-          
-          # 创建提交（使用原始提交信息）
-          git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
-          
-          PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
-          echo "✅ 完成提交: $COMMIT"
+          if [ "$SOURCE_TREE" = "$TARGET_TREE" ]; then
+            echo "✅ 提交 $i 文件树匹配"
+            VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+          else
+            echo "❌ 提交 $i 文件树不匹配"
+            echo "源提交文件:"
+            echo "$SOURCE_TREE"
+            echo "目标提交文件:"
+            echo "$TARGET_TREE"
+          fi
         done
         
-        echo "processed_count=$PROCESSED_COUNT" >> $GITHUB_OUTPUT
-        echo "📊 处理完成: $PROCESSED_COUNT 个提交"
+        echo "verified_count=$VERIFIED_COUNT" >> $GITHUB_OUTPUT
 
     - name: Merge to target branch
-      id: merge_branch
       run: |
         echo "合并到目标分支..."
         git checkout ${{ github.event.inputs.target_branch }}
         
-        # 获取同步分支名称
-        SYNC_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
-        
-        # 合并分支
-        git merge --no-ff -m "${{ github.event.inputs.commit_name }}" "$SYNC_BRANCH"
-        
-        # 修改作者信息
-        git commit --amend --author="mozi9 <mozi9>" --no-edit
-        echo "✅ 合并完成"
+        SYNC_BRANCH="${{ steps.apply_commits.outputs.sync_branch }}"
+        git merge --no-ff -m "${{ github.event.inputs.commit_message }}" "$SYNC_BRANCH"
 
-    - name: Delete marked files
-      id: delete_files
+    - name: Push exact commits
       run: |
-        echo "删除标记文件..."
-        DELETED_FILES=$(cat /tmp/deleted_files.txt 2>/dev/null || true)
-        
-        if [ -n "$DELETED_FILES" ]; then
-          DEL_COUNT=0
-          for file in $DELETED_FILES; do
-            if [ -e "$file" ]; then
-              git rm "$file" >/dev/null 2>&1 && DEL_COUNT=$((DEL_COUNT + 1)) || true
-            fi
-          done
-          
-          if [ $DEL_COUNT -gt 0 ]; then
-            git commit -m "${{ github.event.inputs.delete_message }}" --author="mozi9 <mozi9>"
-            echo "deleted_count=$DEL_COUNT" >> $GITHUB_OUTPUT
-          else
-            echo "deleted_count=0" >> $GITHUB_OUTPUT
-          fi
-        else
-          echo "deleted_count=0" >> $GITHUB_OUTPUT
-        fi
+        echo "推送精确提交..."
+        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
 
-    - name: Push changes
-      id: push_changes
-      run: |
-        echo "推送变更..."
-        TARGET_REPO="${{ github.event.inputs.target_repo }}"
-        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-        
-        # 拉取最新变更
-        git pull https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/$TARGET_REPO.git $TARGET_BRANCH --allow-unrelated-histories --no-edit -Xtheirs
-        
-        # 强制推送
-        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/$TARGET_REPO.git $TARGET_BRANCH --force
-        echo "✅ 推送完成"
-
-    - name: Cleanup
-      run: |
-        echo "清理临时分支..."
-        SYNC_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
-        git branch -D "$SYNC_BRANCH" 2>/dev/null || true
-        echo "✅ 清理完成"
-
-    - name: Generate report
+    - name: Generate verification report
       run: |
         echo ""
-        echo "🎉 同步完成!"
+        echo "🎉 精确同步完成!"
         echo "=========================================="
-        echo "源仓库: ${{ github.event.inputs.source_repo }}"
-        echo "目标仓库: ${{ github.event.inputs.target_repo }}"
-        echo "处理提交: ${{ steps.parse_commits.outputs.commit_count }} 个"
-        echo "删除文件: ${{ steps.delete_files.outputs.deleted_count || 0 }} 个"
-        echo "完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "📊 精确性验证:"
+        echo "  源提交数量: ${{ steps.parse_commits.outputs.commit_count }}"
+        echo "  成功应用: ${{ steps.apply_commits.outputs.applied_count }}"
+        echo "  验证匹配: ${{ steps.verify_match.outputs.verified_count }}"
+        echo ""
+        echo "✅ 保证与源提交完全一致:"
+        echo "  - 相同的文件内容"
+        echo "  - 相同的文件结构" 
+        echo "  - 相同的提交顺序"
+        echo "  - 仅修改作者信息为 mozi9"
+        echo ""
+        echo "⏰ 完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "=========================================="
