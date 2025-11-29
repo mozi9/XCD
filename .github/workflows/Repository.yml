@@ -1,4 +1,4 @@
-name: Update Repository
+name: Cross Repository Sync
 
 on:
   workflow_dispatch:
@@ -43,7 +43,7 @@ on:
         default: 'Sync commit from source repository'
 
 jobs:
-  update-repository:
+  sync-repository:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout current repository
@@ -57,112 +57,149 @@ jobs:
       - name: Parse commit hashes
         id: parse_commits
         run: |
-          COMMITS="${{ github.event.inputs.source_commits }}"
+          # 简单的字符串处理
+          INPUT_COMMITS="${{ github.event.inputs.source_commits }}"
+          echo "Input: $INPUT_COMMITS"
+          
+          # 初始化计数器
           COUNT=0
-          IFS=',' read -ra COMMIT_ARRAY <<< "$COMMITS"
+          
+          # 使用逗号分割
+          IFS=',' read -ra COMMIT_ARRAY <<< "$INPUT_COMMITS"
+          
           for commit in "${COMMIT_ARRAY[@]}"; do
-            commit=$(echo "$commit" | xargs)
-            if [ -n "$commit" ]; then
-              echo "commit_$COUNT=$commit" >> $GITHUB_OUTPUT
-              COUNT=$((COUNT+1))
+            # 去除空格
+            COMMIT_CLEAN=$(echo "$commit" | xargs)
+            if [ -n "$COMMIT_CLEAN" ]; then
+              echo "commit_$COUNT=$COMMIT_CLEAN" >> $GITHUB_OUTPUT
+              echo "Found commit: $COMMIT_CLEAN"
+              COUNT=$((COUNT + 1))
             fi
           done
+          
           echo "commit_count=$COUNT" >> $GITHUB_OUTPUT
-          echo "Found $COUNT commits to process"
+          echo "Total commits found: $COUNT"
           
       - name: Setup target repository
         run: |
-          echo "Setting up target repository: ${{ github.event.inputs.target_repo }}"
-          git clone https://Mozi9_PAT@github.com/${{ github.event.inputs.target_repo }}.git target-repo
+          echo "Cloning target repository: ${{ github.event.inputs.target_repo }}"
+          
+          # 克隆目标仓库
+          git clone https://${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git target-repo
           cd target-repo
-          git checkout ${{ github.event.inputs.target_branch }} || git checkout -b ${{ github.event.inputs.target_branch }}
+          
+          # 检查分支是否存在
+          if git show-ref --verify --quiet refs/heads/${{ github.event.inputs.target_branch }}; then
+            git checkout ${{ github.event.inputs.target_branch }}
+            echo "Checked out existing branch: ${{ github.event.inputs.target_branch }}"
+          else
+            git checkout -b ${{ github.event.inputs.target_branch }}
+            echo "Created new branch: ${{ github.event.inputs.target_branch }}"
+          fi
           
       - name: Add source remote
         run: |
           cd target-repo
+          echo "Adding source remote: ${{ github.event.inputs.source_repo }}"
+          
           git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
           git fetch source ${{ github.event.inputs.source_branch }}
+          
+          echo "Source repository fetched successfully"
           
       - name: Sync commits with unified author
         run: |
           cd target-repo
-          COUNT=${{ steps.parse_commits.outputs.commit_count }}
-          SUCCESS=0
+          echo "Starting commit synchronization..."
           
-          echo "Starting sync of $COUNT commits..."
+          # 获取提交总数
+          TOTAL_COMMITS=${{ steps.parse_commits.outputs.commit_count }}
+          SUCCESS_COUNT=0
           
-          for ((i=0; i<COUNT; i++)); do
+          echo "Processing $TOTAL_COMMITS commits"
+          
+          # 处理每个提交
+          for ((i=0; i<TOTAL_COMMITS; i++)); do
             COMMIT_HASH=${{ steps.parse_commits.outputs['commit_'$i] }}
-            echo "[$((i+1))/$COUNT] Processing: $COMMIT_HASH"
+            echo "=== Processing commit $i: $COMMIT_HASH ==="
             
-            if git cherry-pick $COMMIT_HASH --no-commit 2>/dev/null; then
-              echo "  ✓ Changes applied successfully"
+            # 尝试cherry-pick
+            if git cherry-pick "$COMMIT_HASH" --no-commit 2>/dev/null; then
+              echo "Cherry-pick successful for $COMMIT_HASH"
               HAS_CHANGES=true
             else
-              echo "  ⚠ Handling conflicts and file operations..."
+              echo "Cherry-pick encountered conflicts for $COMMIT_HASH"
               HAS_CHANGES=false
               
-              git status --porcelain | while read line; do
-                STATUS=${line:0:2}
-                FILE=${line:3}
-                
-                case $STATUS in
-                  "UU"|"AA"|"DD")
-                    if [ -f "$FILE" ]; then
-                      git checkout --ours "$FILE"
-                      git add "$FILE"
-                    fi
-                    ;;
-                  " D")
-                    if [ -f "$FILE" ]; then
-                      git rm "$FILE"
-                      HAS_CHANGES=true
-                    fi
-                    ;;
-                  "R"*)
-                    OLD_FILE=$(echo "$line" | cut -d' ' -f2)
-                    NEW_FILE=$(echo "$line" | cut -d' ' -f3)
-                    if [ -f "$OLD_FILE" ]; then
-                      git mv "$OLD_FILE" "$NEW_FILE"
-                      HAS_CHANGES=true
-                    fi
-                    ;;
-                esac
+              # 处理冲突文件
+              git status --porcelain | while read -r line; do
+                if [ -n "$line" ]; then
+                  STATUS="${line:0:2}"
+                  FILE_PATH="${line:3}"
+                  
+                  case "$STATUS" in
+                    "UU"|"AA"|"DD")
+                      if [ -f "$FILE_PATH" ]; then
+                        echo "Resolving conflict: $FILE_PATH (using source version)"
+                        git checkout --ours "$FILE_PATH"
+                        git add "$FILE_PATH"
+                      fi
+                      ;;
+                    " D")
+                      if [ -f "$FILE_PATH" ]; then
+                        echo "Deleting file: $FILE_PATH"
+                        git rm "$FILE_PATH"
+                        HAS_CHANGES=true
+                      fi
+                      ;;
+                  esac
+                fi
               done
             fi
             
+            # 添加所有更改
             git add -A
             
+            # 检查是否有更改或需要创建空提交
             if [ "$HAS_CHANGES" = "true" ] || git diff --cached --quiet; then
-              git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
+              # 创建提交，强制使用指定的作者
+              NEW_MESSAGE="${{ github.event.inputs.commit_message }} [$COMMIT_HASH]"
+              
+              git commit -m "$NEW_MESSAGE" \
                 --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
                 --allow-empty \
                 --keep-redundant-commits
-              SUCCESS=$((SUCCESS+1))
-              echo "  ✓ Commit created with author: ${{ github.event.inputs.new_author_name }}"
+              
+              echo "Committed with author: ${{ github.event.inputs.new_author_name }}"
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             else
-              echo "  ⏭ Skipped empty commit"
+              echo "No changes to commit for $COMMIT_HASH"
             fi
           done
           
-          echo "Sync completed: $SUCCESS/$COUNT commits successful"
+          echo "Synchronization completed: $SUCCESS_COUNT/$TOTAL_COMMITS commits processed successfully"
           
-      - name: Push changes to target
+      - name: Push to target repository
         run: |
           cd target-repo
-          git push origin ${{ github.event.inputs.target_branch }}
-          echo "✓ Changes pushed to ${{ github.event.inputs.target_branch }}"
+          echo "Pushing changes to target repository..."
           
-      - name: Cleanup workspace
+          git push origin ${{ github.event.inputs.target_branch }}
+          
+          echo "Push completed successfully"
+          
+      - name: Cleanup
         if: always()
         run: |
+          echo "Cleaning up temporary files..."
           rm -rf target-repo
+          echo "Cleanup completed"
           
       - name: Workflow summary
         run: |
-          echo "🎉 Repository update completed!"
-          echo "📦 Source: ${{ github.event.inputs.source_repo }}:${{ github.event.inputs.source_branch }}"
-          echo "🎯 Target: ${{ github.event.inputs.target_repo }}:${{ github.event.inputs.target_branch }}"
-          echo "📝 Commits processed: ${{ steps.parse_commits.outputs.commit_count }}"
-          echo "👤 Author: ${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>"
-          echo "✨ All source commit authors have been replaced with mozi9"
+          echo "🎉 Cross repository sync completed!"
+          echo "Source: ${{ github.event.inputs.source_repo }}:${{ github.event.inputs.source_branch }}"
+          echo "Target: ${{ github.event.inputs.target_repo }}:${{ github.event.inputs.target_branch }}"
+          echo "Commits processed: ${{ steps.parse_commits.outputs.commit_count }}"
+          echo "Author: ${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>"
+          echo "All source commit authors have been replaced with mozi9"
