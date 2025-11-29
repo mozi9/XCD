@@ -1,0 +1,188 @@
+name: Cross Repository Sync (mozi9 - Complete)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # 源仓库配置
+      source_repo:
+        description: '源仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'mozi9/source-repo'
+        type: string
+      source_branch:
+        description: '源仓库分支'
+        required: true
+        default: 'main'
+        type: string
+      source_commits:
+        description: '源提交哈希 (多个用逗号分隔，如: abc123,def456)'
+        required: true
+        type: string
+      
+      # 目标仓库配置
+      target_repo:
+        description: '目标仓库地址 (格式: owner/repo)'
+        required: true
+        type: string
+      target_branch:
+        description: '目标仓库分支'
+        required: true
+        default: 'main'
+        type: string
+      
+      # 提交配置 - 新增作者配置
+      new_author_name:
+        description: '新作者名称'
+        required: true
+        default: 'mozi9'
+        type: string
+      new_author_email:
+        description: '新作者邮箱'
+        required: true
+        default: 'mozi9@example.com'
+        type: string
+      commit_message:
+        description: '提交信息'
+        required: true
+        default: 'Sync commit from source repository'
+        type: string
+
+jobs:
+  sync-repository:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+        
+      - name: 设置Git用户信息
+        run: |
+          git config --global user.name "mozi9"
+          git config --global user.email "mozi9@example.com"
+      
+      - name: 解析提交哈希
+        id: parse_commits
+        run: |
+          # 清理输入并分割成数组
+          CLEAN_INPUT=$(echo "${{ github.event.inputs.source_commits }}" | tr -d ' ')
+          IFS=',' read -ra COMMITS <<< "$CLEAN_INPUT"
+          echo "commit_count=${#COMMITS[@]}" >> $GITHUB_OUTPUT
+          
+          for i in "${!COMMITS[@]}"; do
+            echo "commit_$i=${COMMITS[$i]}" >> $GITHUB_OUTPUT
+            echo "✅ 解析提交 $((i+1)): ${COMMITS[$i]}"
+          done
+          
+          if [ ${#COMMITS[@]} -eq 0 ]; then
+            echo "❌ 没有找到有效的提交哈希"
+            exit 1
+          fi
+      
+      - name: 设置目标仓库
+        run: |
+          echo "🎯 设置目标仓库: ${{ github.event.inputs.target_repo }}"
+          
+          # 克隆目标仓库（保留完整历史，静默模式）
+          git clone --quiet https://Mozi9_PAT@github.com/${{ github.event.inputs.target_repo }}.git target-repo
+          cd target-repo
+          
+          # 切换到目标分支
+          if git show-ref --verify --quiet refs/heads/${{ github.event.inputs.target_branch }}; then
+            git checkout --quiet ${{ github.event.inputs.target_branch }}
+          else
+            echo "🆕 创建新分支: ${{ github.event.inputs.target_branch }}"
+            git checkout -b ${{ github.event.inputs.target_branch }}
+          fi
+          
+          echo "✅ 目标仓库设置完成"
+      
+      - name: 添加源仓库
+        run: |
+          cd target-repo
+          echo "🔗 添加源仓库..."
+          
+          git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
+          git fetch --quiet source ${{ github.event.inputs.source_branch }}
+          
+          echo "✅ 源仓库连接就绪"
+      
+      - name: 执行同步操作（统一作者mozi9）
+        run: |
+          cd target-repo
+          echo "🚀 开始同步提交（所有作者改为 ${{ github.event.inputs.new_author_name }}）..."
+          
+          SUCCESS_COUNT=0
+          TOTAL_COUNT=${{ steps.parse_commits.outputs.commit_count }}
+          
+          # 逐个同步提交
+          for ((i=0; i<TOTAL_COUNT; i++)); do
+            COMMIT_HASH=${{ steps.parse_commits.outputs['commit_'$i] }}
+            INDEX=$((i+1))
+            
+            echo "🔄 [$INDEX/$TOTAL_COUNT] $COMMIT_HASH"
+            
+            # 执行cherry-pick
+            if git cherry-pick $COMMIT_HASH --no-commit 2>/dev/null; then
+              echo "   ✅ 应用成功"
+              HAS_CHANGES=true
+            else
+              echo "   ⚠️  处理冲突..."
+              HAS_CHANGES=false
+              
+              # 处理冲突和文件操作
+              git status --porcelain | grep "^UU\|^AA\|^DD" | cut -c4- | while read file; do
+                [ -f "$file" ] && git checkout --ours "$file" && git add "$file"
+              done
+              
+              git status --porcelain | grep "^ D" | cut -c3- | while read file; do
+                [ -f "$file" ] && git rm "$file" && HAS_CHANGES=true
+              done
+              
+              git status --porcelain | grep "^R" | while read line; do
+                OLD=$(echo "$line" | awk '{print $2}')
+                NEW=$(echo "$line" | awk '{print $3}')
+                [ -f "$OLD" ] && git mv "$OLD" "$NEW" && HAS_CHANGES=true
+              done
+            fi
+            
+            # 添加更改
+            git add -A
+            
+            # 创建提交 - 强制使用mozi9作为作者，忽略源提交的所有作者信息
+            if [ "$HAS_CHANGES" = "true" ] || git diff --cached --quiet; then
+              git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
+                --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
+                --allow-empty \
+                --keep-redundant-commits
+              echo "   ✅ 已提交 (作者: ${{ github.event.inputs.new_author_name }})"
+              ((SUCCESS_COUNT++))
+            else
+              echo "   ⏭️  跳过空提交"
+            fi
+          done
+          
+          echo "📊 同步完成: $SUCCESS_COUNT/$TOTAL_COUNT"
+          echo "👤 所有提交作者已统一为: ${{ github.event.inputs.new_author_name }}"
+      
+      - name: 推送更改
+        run: |
+          cd target-repo
+          echo "📤 推送更改..."
+          
+          git push origin ${{ github.event.inputs.target_branch }}
+          
+          echo "✅ 推送成功"
+      
+      - name: 清理
+        if: always()
+        run: |
+          rm -rf target-repo
+      
+      - name: 完成
+        run: |
+          echo "🎉 同步完成！"
+          echo "源: ${{ github.event.inputs.source_repo }}"
+          echo "目标: ${{ github.event.inputs.target_repo }}"
+          echo "提交数: ${{ steps.parse_commits.outputs.commit_count }}"
+          echo "👤 统一作者: ${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>"
+          echo "✅ 所有源提交的作者信息已被替换为 mozi9"
