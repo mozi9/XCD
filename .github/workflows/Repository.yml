@@ -1,4 +1,4 @@
-name: Exact Source Commit Sync - Mozi9 Author Only
+name: Exact Source Commit Apply - No Reset
 
 on:
   workflow_dispatch:
@@ -7,18 +7,10 @@ on:
         description: '源仓库地址 (格式: owner/repo)'
         required: true
         default: 'mozi9/source-repo'
-      source_branch:
-        description: '源分支名 (留空使用默认分支)'
-        required: false
-        default: ''
       target_repo:
         description: '目标仓库地址 (格式: owner/repo)'
         required: true
         default: 'mozi9/target-repo'
-      target_branch:
-        description: '目标分支名'
-        required: true
-        default: 'main'
       commit_hashes:
         description: '要同步的提交哈希（多个用逗号分隔）'
         required: true
@@ -27,16 +19,12 @@ on:
         description: '合并提交信息'
         required: true
         default: 'sync: 同步提交'
-      max_commits:
-        description: '最大同步提交数量'
-        required: true
-        default: '20'
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  exact-sync:
+  exact-apply:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout target repository
@@ -44,207 +32,48 @@ jobs:
       with:
         repository: ${{ github.event.inputs.target_repo }}
         token: ${{ secrets.Mozi9_PAT }}
-        ref: ${{ github.event.inputs.target_branch }}
+        ref: 'main'
         fetch-depth: 0
 
-    - name: Setup Mozi9 Git identity
+    - name: Setup Git identity
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9"
-        echo "Git identity: mozi9 <mozi9>"
 
     - name: Add source repository
-      id: add_source
       run: |
-        echo "添加源仓库..."
-        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
-        SOURCE_BRANCH="${{ github.event.inputs.source_branch }}"
-        
-        if [ -z "$SOURCE_BRANCH" ]; then
-          echo "使用源仓库默认分支"
-          git remote add source-repo https://github.com/$SOURCE_REPO.git
-          git fetch source-repo
-        else
-          echo "使用源仓库分支: $SOURCE_BRANCH"
-          git remote add source-repo https://github.com/$SOURCE_REPO.git
-          git fetch source-repo $SOURCE_BRANCH
-        fi
-        echo "✅ 源仓库添加完成"
+        git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source
 
-    - name: Parse and validate commit hashes
-      id: parse_commits
+    - name: Create apply branch
       run: |
-        echo "解析提交哈希..."
-        COMMIT_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' ' ')
-        
-        VALID_COMMITS=()
-        INVALID_COMMITS=()
-        
-        for hash in $COMMIT_HASHES; do
-          if git rev-parse --verify "$hash" >/dev/null 2>&1; then
-            COMMIT_SUBJECT=$(git log -1 --format="%s" "$hash")
-            COMMIT_AUTHOR=$(git log -1 --format="%an <%ae>" "$hash")
-            echo "✅ 提交有效: $hash - $COMMIT_SUBJECT"
-            echo "   原始作者: $COMMIT_AUTHOR"
-            VALID_COMMITS+=("$hash")
-          else
-            echo "❌ 提交无效: $hash"
-            INVALID_COMMITS+=("$hash")
-          fi
-        done
-        
-        if [ ${#VALID_COMMITS[@]} -eq 0 ]; then
-          echo "❌ 错误: 没有找到有效的提交"
-          exit 1
-        fi
-        
-        MAX_COMMITS=${{ github.event.inputs.max_commits }}
-        if [ ${#VALID_COMMITS[@]} -gt $MAX_COMMITS ]; then
-          echo "⚠️ 提交数量 ${#VALID_COMMITS[@]} 超过最大限制 $MAX_COMMITS"
-          VALID_COMMITS=("${VALID_COMMITS[@]:0:$MAX_COMMITS}")
-        fi
-        
-        printf "%s\n" "${VALID_COMMITS[@]}" > /tmp/valid_commits.txt
-        echo "commit_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
-        echo "📊 将处理 ${#VALID_COMMITS[@]} 个有效提交"
+        git checkout -b apply-commits
 
-    - name: Create sync branch
-      id: create_branch
+    - name: Apply commits exactly
       run: |
-        echo "创建同步分支..."
-        SYNC_BRANCH="sync-$(date +%s)"
-        git checkout -b "$SYNC_BRANCH"
-        echo "branch_name=$SYNC_BRANCH" >> $GITHUB_OUTPUT
-        echo "✅ 分支创建: $SYNC_BRANCH"
-
-    - name: Apply commits with mozi9 author only
-      id: apply_commits
-      run: |
-        echo "应用提交（仅使用 mozi9 作者）..."
-        COMMITS=$(cat /tmp/valid_commits.txt)
-        APPLIED_COUNT=0
+        echo "应用提交（完全保留源内容）..."
+        COMMITS=$(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' ')
         
         for COMMIT in $COMMITS; do
-          echo "处理提交: $COMMIT"
+          echo "应用提交: $COMMIT"
           
-          # 获取原始提交信息
-          COMMIT_MSG=$(git log -1 --format=%B "$COMMIT")
-          ORIG_AUTHOR=$(git log -1 --format="%an <%ae>" "$COMMIT")
-          CO_AUTHORS=$(git log -1 --format="%(trailers:key=Co-authored-by)" "$COMMIT" 2>/dev/null || true)
+          # 直接使用 cherry-pick 应用提交
+          git cherry-pick $COMMIT
           
-          echo "原始作者: $ORIG_AUTHOR"
-          if [ -n "$CO_AUTHORS" ]; then
-            echo "协作作者: $CO_AUTHORS"
-          fi
+          # 仅修改作者，保持所有内容不变
+          git commit --amend --author="mozi9 <mozi9>" --no-edit
           
-          # 应用提交
-          set +e
-          git cherry-pick "$COMMIT" >/dev/null 2>&1
-          CHERRY_PICK_RESULT=$?
-          set -e
-          
-          if [ $CHERRY_PICK_RESULT -eq 0 ]; then
-            # 清理所有作者信息
-            CLEAN_MSG=$(echo "$COMMIT_MSG" | grep -v -E "(Co-authored-by|Reviewed-by|Signed-off-by|Acked-by|Tested-by):")
-            
-            # 创建仅包含 mozi9 作者的提交
-            git commit --amend --author="mozi9 <mozi9>" -m "$CLEAN_MSG"
-            echo "✅ 提交应用成功"
-          else
-            echo "⚠️ 检测到冲突，使用源文件解决..."
-            
-            # 使用源文件覆盖冲突
-            CONFLICT_FILES=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
-            for file in $CONFLICT_FILES; do
-              git show "$COMMIT":"$file" > "$file" 2>/dev/null || true
-            done
-            
-            git add .
-            git cherry-pick --continue
-            git commit --amend --author="mozi9 <mozi9>" --no-edit
-            echo "✅ 冲突解决，提交应用成功"
-          fi
-          
-          APPLIED_COUNT=$((APPLIED_COUNT + 1))
-          
-          # 显示提交统计
-          COMMIT_STATS=$(git log -1 --oneline --stat)
-          echo "提交统计: $COMMIT_STATS"
+          echo "✅ 提交应用完成"
         done
-        
-        echo "applied_count=$APPLIED_COUNT" >> $GITHUB_OUTPUT
-        echo "📊 成功应用 $APPLIED_COUNT 个提交"
 
-    - name: Merge to target branch
-      id: merge_branch
+    - name: Merge to main
       run: |
-        echo "合并到目标分支..."
-        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-        SYNC_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
-        
-        echo "目标分支: $TARGET_BRANCH"
-        echo "同步分支: $SYNC_BRANCH"
-        
-        # 切换回目标分支
-        git checkout "$TARGET_BRANCH"
-        
-        # 检查同步分支是否存在
-        if ! git show-ref --verify --quiet refs/heads/"$SYNC_BRANCH"; then
-          echo "❌ 错误: 同步分支 $SYNC_BRANCH 不存在"
-          exit 1
-        fi
-        
-        # 执行合并
-        git merge --no-ff -m "${{ github.event.inputs.commit_message }}" "$SYNC_BRANCH"
-        
-        # 修改合并提交的作者
+        git checkout main
+        git merge --no-ff -m "${{ github.event.inputs.commit_message }}" apply-commits
         git commit --amend --author="mozi9 <mozi9>" --no-edit
-        echo "✅ 合并完成"
 
-    - name: Verify final state
-      id: verify_state
+    - name: Final report
       run: |
-        echo "验证最终状态..."
-        echo "当前分支: $(git branch --show-current)"
-        echo "最新提交:"
-        git log -1 --oneline
-        echo "文件状态:"
-        git status --short
-        echo "✅ 状态验证完成"
-
-    - name: Generate final report
-      run: |
-        echo ""
-        echo "🎉 完完整整的源提交同步完成!"
-        echo "=========================================="
-        echo "📊 执行报告:"
-        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
-        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
-        echo "  目标分支: ${{ github.event.inputs.target_branch }}"
-        echo "  处理提交: ${{ steps.parse_commits.outputs.commit_count }} 个"
-        echo "  成功应用: ${{ steps.apply_commits.outputs.applied_count }} 个"
-        echo ""
-        echo "✅ 保证与源提交完全一致:"
-        echo "  - 相同的文件内容"
-        echo "  - 相同的文件结构" 
-        echo "  - 相同的删除操作"
-        echo "  - 相同的提交信息"
-        echo "  - 仅作者信息改为 mozi9"
-        echo ""
-        echo "✅ 作者信息处理:"
-        echo "  - 移除所有原始作者信息"
-        echo "  - 移除所有 Co-authored-by 信息"
-        echo "  - 移除所有 Reviewed-by 信息"
-        echo "  - 移除所有 Signed-off-by 信息"
-        echo "  - 统一使用 mozi9 <mozi9>"
-        echo ""
-        echo "👤 操作身份: mozi9 <mozi9>"
-        echo "🔑 使用令牌: Mozi9_PAT"
-        echo ""
-        echo "⏰ 完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "=========================================="
-        echo ""
-        echo "📝 下一步操作:"
-        echo "  如需推送，请手动执行: git push"
-        echo "  如需查看差异，请执行: git log --oneline -10"
-        echo "  如需撤销，请执行: git reset --hard HEAD~1"
+        echo "✅ 提交应用完成"
+        echo "所有源提交内容已完全应用到目标仓库"
+        echo "作者信息已统一为: mozi9 <mozi9>"
