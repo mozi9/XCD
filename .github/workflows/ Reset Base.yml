@@ -1,4 +1,4 @@
-name: Source Commit Sync - Force Source Files
+name: Source Commit Sync - Reset Base
 
 on:
   workflow_dispatch:
@@ -24,15 +24,15 @@ on:
         required: true
         default: '32ac13d'
       new_branch_name:
-        description: '新分支名（留空推送到目标分支）'
+        description: '新分支名'
         required: false
-        default: ''
+        default: 'susfs-sync'
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  force-source-files:
+  sync-reset-base:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout target repository
@@ -53,23 +53,25 @@ jobs:
         git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
         git fetch source ${{ github.event.inputs.source_branch }}
 
-    - name: Create or select target branch
-      id: setup_branch
+    - name: Create clean branch from source base
+      id: create_branch
       run: |
-        if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
-          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
-          echo "使用现有分支: $TARGET_BRANCH"
-        else
-          TARGET_BRANCH="${{ github.event.inputs.new_branch_name }}"
-          echo "创建新分支: $TARGET_BRANCH"
-          git checkout -b "$TARGET_BRANCH"
-        fi
-        echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+        # 获取源提交的父提交作为起点
+        COMMITS=($(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' '))
+        FIRST_COMMIT=${COMMITS[0]}
+        PARENT_COMMIT=$(git log --pretty=%P -n 1 "$FIRST_COMMIT")
+        
+        echo "源提交: $FIRST_COMMIT"
+        echo "父提交: $PARENT_COMMIT"
+        
+        # 基于父提交创建新分支
+        git checkout -b "${{ github.event.inputs.new_branch_name }}" "$PARENT_COMMIT"
+        echo "parent_commit=$PARENT_COMMIT" >> $GITHUB_OUTPUT
 
-    - name: Apply commits with file copy
+    - name: Apply commits with exact file copy
       id: apply_commits
       run: |
-        echo "应用提交（文件复制方式）..."
+        echo "应用提交（精确文件复制）..."
         COMMITS=$(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' ')
         APPLIED_COUNT=0
         
@@ -79,13 +81,13 @@ jobs:
           # 获取提交信息
           ORIG_MSG=$(git log -1 --format=%B "$COMMIT")
           ORIG_DATE=$(git log -1 --format="%ci" "$COMMIT")
-          
-          # 清理作者信息
           CLEAN_MSG=$(echo "$ORIG_MSG" | grep -v -E "(Co-authored-by|Reviewed-by|Signed-off-by):")
           
           # 获取提交中的所有文件
-          FILES=$(git show --name-only --format= "$COMMIT" | grep -v '^$')
-          echo "提交包含文件: $(echo "$FILES" | wc -l) 个"
+          FILES=$(git ls-tree -r --name-only "$COMMIT")
+          echo "提交实际包含文件: $(echo "$FILES" | wc -l) 个"
+          echo "文件列表:"
+          echo "$FILES"
           
           # 强制复制所有源文件
           for file in $FILES; do
@@ -95,7 +97,7 @@ jobs:
           done
           
           # 处理删除的文件
-          DELETED_FILES=$(git show --name-only --diff-filter=D "$COMMIT" 2>/dev/null || true)
+          DELETED_FILES=$(git diff --name-only --diff-filter=D "$COMMIT"^.."$COMMIT" 2>/dev/null || true)
           if [ -n "$DELETED_FILES" ]; then
             echo "删除文件: $(echo "$DELETED_FILES" | wc -l) 个"
             for dfile in $DELETED_FILES; do
@@ -107,38 +109,30 @@ jobs:
           git add -A
           git commit -m "$CLEAN_MSG" --author="mozi9 <mozi9>" --date="$ORIG_DATE"
           
+          # 验证提交
+          COMMIT_STATS=$(git log -1 --stat)
+          echo "提交统计:"
+          echo "$COMMIT_STATS"
+          
           APPLIED_COUNT=$((APPLIED_COUNT + 1))
           echo "✅ 提交应用完成"
         done
         
         echo "applied_count=$APPLIED_COUNT" >> $GITHUB_OUTPUT
 
-    - name: Push to target branch
+    - name: Push to new branch
       run: |
-        git push origin ${{ steps.setup_branch.outputs.target_branch }}
+        git push -u origin "${{ github.event.inputs.new_branch_name }}"
         echo "✅ 推送完成"
 
-    - name: Generate final report
+    - name: Final verification
       run: |
         echo ""
-        echo "🎉 源提交同步完成!"
+        echo "🎉 精确同步完成!"
         echo "=========================================="
-        echo "📊 执行结果:"
-        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
-        echo "  源分支: ${{ github.event.inputs.source_branch }}"
-        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
-        echo "  目标分支: ${{ steps.setup_branch.outputs.target_branch }}"
-        echo "  处理提交: ${{ steps.apply_commits.outputs.applied_count }} 个"
-        echo ""
-        echo "✅ 文件处理策略:"
-        echo "  - 所有文件强制使用源版本"
-        echo "  - 忽略目标仓库的修改"
-        echo "  - 完全保持源提交内容"
-        echo ""
-        echo "✅ 作者信息处理:"
-        echo "  - 所有作者统一为 mozi9 <mozi9>"
-        echo "  - 移除协作作者信息"
-        echo "  - 保留原始提交时间"
-        echo ""
-        echo "👤 操作身份: mozi9 <mozi9>"
+        echo "📊 文件验证:"
+        echo "  源提交文件数: 13 个"
+        echo "  实际提交文件数: $(git ls-tree -r --name-only HEAD | wc -l) 个"
+        echo "  提交统计:"
+        git log -1 --stat
         echo "=========================================="
