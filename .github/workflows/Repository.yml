@@ -57,149 +57,101 @@ jobs:
       - name: Parse commit hashes
         id: parse_commits
         run: |
-          # 简单的字符串处理
           INPUT_COMMITS="${{ github.event.inputs.source_commits }}"
-          echo "Input: $INPUT_COMMITS"
-          
-          # 初始化计数器
           COUNT=0
-          
-          # 使用逗号分割
           IFS=',' read -ra COMMIT_ARRAY <<< "$INPUT_COMMITS"
           
           for commit in "${COMMIT_ARRAY[@]}"; do
-            # 去除空格
             COMMIT_CLEAN=$(echo "$commit" | xargs)
             if [ -n "$COMMIT_CLEAN" ]; then
               echo "commit_$COUNT=$COMMIT_CLEAN" >> $GITHUB_OUTPUT
-              echo "Found commit: $COMMIT_CLEAN"
               COUNT=$((COUNT + 1))
             fi
           done
-          
           echo "commit_count=$COUNT" >> $GITHUB_OUTPUT
-          echo "Total commits found: $COUNT"
           
       - name: Setup target repository
         run: |
-          echo "Cloning target repository: ${{ github.event.inputs.target_repo }}"
-          
-          # 克隆目标仓库
           git clone https://${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git target-repo
           cd target-repo
-          
-          # 检查分支是否存在
-          if git show-ref --verify --quiet refs/heads/${{ github.event.inputs.target_branch }}; then
-            git checkout ${{ github.event.inputs.target_branch }}
-            echo "Checked out existing branch: ${{ github.event.inputs.target_branch }}"
-          else
-            git checkout -b ${{ github.event.inputs.target_branch }}
-            echo "Created new branch: ${{ github.event.inputs.target_branch }}"
-          fi
+          git checkout ${{ github.event.inputs.target_branch }} || git checkout -b ${{ github.event.inputs.target_branch }}
           
       - name: Add source remote
         run: |
           cd target-repo
-          echo "Adding source remote: ${{ github.event.inputs.source_repo }}"
-          
           git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
           git fetch source ${{ github.event.inputs.source_branch }}
           
-          echo "Source repository fetched successfully"
-          
-      - name: Sync commits with unified author
+      - name: Sync single commit
+        if: ${{ steps.parse_commits.outputs.commit_count == '1' }}
         run: |
           cd target-repo
-          echo "Starting commit synchronization..."
+          COMMIT_HASH=${{ steps.parse_commits.outputs.commit_0 }}
           
-          # 获取提交总数
-          TOTAL_COMMITS=${{ steps.parse_commits.outputs.commit_count }}
-          SUCCESS_COUNT=0
+          git cherry-pick "$COMMIT_HASH" --no-commit || {
+            git status --porcelain | while read -r line; do
+              if [ -n "$line" ]; then
+                STATUS="${line:0:2}"
+                FILE_PATH="${line:3}"
+                case "$STATUS" in
+                  "UU"|"AA"|"DD")
+                    [ -f "$FILE_PATH" ] && git checkout --ours "$FILE_PATH" && git add "$FILE_PATH"
+                    ;;
+                  " D")
+                    [ -f "$FILE_PATH" ] && git rm "$FILE_PATH"
+                    ;;
+                esac
+              fi
+            done
+          }
           
-          echo "Processing $TOTAL_COMMITS commits"
-          
-          # 处理每个提交
-          for ((i=0; i<TOTAL_COMMITS; i++)); do
-            COMMIT_HASH=${{ steps.parse_commits.outputs['commit_'$i] }}
-            echo "=== Processing commit $i: $COMMIT_HASH ==="
+          git add -A
+          git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
+            --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
+            --allow-empty --keep-redundant-commits
             
-            # 尝试cherry-pick
-            if git cherry-pick "$COMMIT_HASH" --no-commit 2>/dev/null; then
-              echo "Cherry-pick successful for $COMMIT_HASH"
-              HAS_CHANGES=true
-            else
-              echo "Cherry-pick encountered conflicts for $COMMIT_HASH"
-              HAS_CHANGES=false
-              
-              # 处理冲突文件
+      - name: Sync multiple commits
+        if: ${{ steps.parse_commits.outputs.commit_count > '1' }}
+        run: |
+          cd target-repo
+          TOTAL=${{ steps.parse_commits.outputs.commit_count }}
+          
+          for ((i=0; i<TOTAL; i++)); do
+            COMMIT_HASH=${{ steps.parse_commits.outputs['commit_'$i] }}
+            
+            git cherry-pick "$COMMIT_HASH" --no-commit || {
               git status --porcelain | while read -r line; do
                 if [ -n "$line" ]; then
                   STATUS="${line:0:2}"
                   FILE_PATH="${line:3}"
-                  
                   case "$STATUS" in
                     "UU"|"AA"|"DD")
-                      if [ -f "$FILE_PATH" ]; then
-                        echo "Resolving conflict: $FILE_PATH (using source version)"
-                        git checkout --ours "$FILE_PATH"
-                        git add "$FILE_PATH"
-                      fi
+                      [ -f "$FILE_PATH" ] && git checkout --ours "$FILE_PATH" && git add "$FILE_PATH"
                       ;;
                     " D")
-                      if [ -f "$FILE_PATH" ]; then
-                        echo "Deleting file: $FILE_PATH"
-                        git rm "$FILE_PATH"
-                        HAS_CHANGES=true
-                      fi
+                      [ -f "$FILE_PATH" ] && git rm "$FILE_PATH"
                       ;;
                   esac
                 fi
               done
-            fi
+            }
             
-            # 添加所有更改
             git add -A
-            
-            # 检查是否有更改或需要创建空提交
-            if [ "$HAS_CHANGES" = "true" ] || git diff --cached --quiet; then
-              # 创建提交，强制使用指定的作者
-              NEW_MESSAGE="${{ github.event.inputs.commit_message }} [$COMMIT_HASH]"
-              
-              git commit -m "$NEW_MESSAGE" \
-                --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
-                --allow-empty \
-                --keep-redundant-commits
-              
-              echo "Committed with author: ${{ github.event.inputs.new_author_name }}"
-              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-              echo "No changes to commit for $COMMIT_HASH"
-            fi
+            git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
+              --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
+              --allow-empty --keep-redundant-commits
           done
           
-          echo "Synchronization completed: $SUCCESS_COUNT/$TOTAL_COMMITS commits processed successfully"
-          
-      - name: Push to target repository
+      - name: Push changes
         run: |
           cd target-repo
-          echo "Pushing changes to target repository..."
-          
           git push origin ${{ github.event.inputs.target_branch }}
-          
-          echo "Push completed successfully"
           
       - name: Cleanup
         if: always()
+        run: rm -rf target-repo
+        
+      - name: Summary
         run: |
-          echo "Cleaning up temporary files..."
-          rm -rf target-repo
-          echo "Cleanup completed"
-          
-      - name: Workflow summary
-        run: |
-          echo "🎉 Cross repository sync completed!"
-          echo "Source: ${{ github.event.inputs.source_repo }}:${{ github.event.inputs.source_branch }}"
-          echo "Target: ${{ github.event.inputs.target_repo }}:${{ github.event.inputs.target_branch }}"
-          echo "Commits processed: ${{ steps.parse_commits.outputs.commit_count }}"
-          echo "Author: ${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>"
-          echo "All source commit authors have been replaced with mozi9"
+          echo "Sync completed: ${{ steps.parse_commits.outputs.commit_count }} commits"
+          echo "Author: ${{ github.event.inputs.new_author_name }}"
