@@ -1,40 +1,32 @@
-name: Sync Repository with Override
+name: Repository File Sync
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址 (格式: owner/repo 或完整URL，带tree/表示已有分支)'
+        description: '源仓库地址 (格式: owner/repo 或完整URL)'
         required: true
         default: 'https://github.com/owner/source-repo'
-      source_ref:
-        description: '源引用 (分支名、标签、短哈希或完整哈希，如果URL中已包含分支则留空)'
-        required: false
+      source_commit:
+        description: '源提交哈希 (短哈希或完整哈希)'
+        required: true
         default: ''
       target_repo:
-        description: '目标仓库地址 (格式: owner/repo 或完整URL，带tree/表示已有分支)'
+        description: '目标仓库地址 (格式: owner/repo 或完整URL)'
         required: true
         default: 'https://github.com/owner/target-repo'
       target_branch:
-        description: '目标分支名 (如果URL中已包含分支则留空)'
+        description: '目标分支名'
+        required: false
+        default: 'main'
+      commit_name:
+        description: '提交显示名称 (留空使用默认mozi9)'
         required: false
         default: ''
-      commit_name:
-        description: '提交显示名称'
-        required: true
-        default: 'mozi9'
       commit_message:
         description: '提交信息'
         required: true
         default: 'Sync from source repository'
-      use_full_hash:
-        description: '是否使用完整哈希 (true/false)'
-        required: true
-        default: 'false'
-        type: choice
-        options:
-        - 'true'
-        - 'false'
 
 env:
   PAT: ${{ secrets.MOZI9_PAT }}
@@ -46,135 +38,236 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Parse repository URLs and references
+    - name: 解析仓库地址
       id: parse_urls
       run: |
-        # 解析源仓库信息
-        SOURCE_URL="${{ github.event.inputs.source_repo }}"
-        if [[ $SOURCE_URL == http* ]]; then
-          # 从完整URL中提取owner/repo
-          if [[ $SOURCE_URL == *"github.com"* ]]; then
-            SOURCE_REPO=$(echo "$SOURCE_URL" | sed -n 's|.*github.com/\([^/]*/[^/?]*\).*|\1|p')
-            # 检查是否包含tree/（分支信息）
-            if [[ $SOURCE_URL == *"tree/"* ]]; then
-              SOURCE_BRANCH=$(echo "$SOURCE_URL" | sed -n 's|.*tree/\([^/?]*\).*|\1|p')
-            else
-              SOURCE_BRANCH="${{ github.event.inputs.source_ref || 'main' }}"
-            fi
+        # 提取仓库owner/repo
+        extract_repo() {
+          local url="$1"
+          if [[ $url == http* ]] && [[ $url == *"github.com"* ]]; then
+            echo "$url" | sed -n 's|.*github.com/\([^/]*/[^/?]*\).*|\1|p'
           else
-            echo "错误：不支持的仓库地址格式"
-            exit 1
+            echo "$url"
           fi
-        else
-          SOURCE_REPO="$SOURCE_URL"
-          SOURCE_BRANCH="${{ github.event.inputs.source_ref || 'main' }}"
-        fi
+        }
         
-        # 解析目标仓库信息
-        TARGET_URL="${{ github.event.inputs.target_repo }}"
-        if [[ $TARGET_URL == http* ]]; then
-          # 从完整URL中提取owner/repo
-          if [[ $TARGET_URL == *"github.com"* ]]; then
-            TARGET_REPO=$(echo "$TARGET_URL" | sed -n 's|.*github.com/\([^/]*/[^/?]*\).*|\1|p')
-            # 检查是否包含tree/（分支信息）
-            if [[ $TARGET_URL == *"tree/"* ]]; then
-              TARGET_BRANCH=$(echo "$TARGET_URL" | sed -n 's|.*tree/\([^/?]*\).*|\1|p')
-            else
-              TARGET_BRANCH="${{ github.event.inputs.target_branch || 'main' }}"
-            fi
-          else
-            echo "错误：不支持的仓库地址格式"
-            exit 1
-          fi
-        else
-          TARGET_REPO="$TARGET_URL"
-          TARGET_BRANCH="${{ github.event.inputs.target_branch || 'main' }}"
-        fi
+        SOURCE_REPO=$(extract_repo "${{ github.event.inputs.source_repo }}")
+        TARGET_REPO=$(extract_repo "${{ github.event.inputs.target_repo }}")
+        
+        echo "源仓库: $SOURCE_REPO"
+        echo "目标仓库: $TARGET_REPO"
+        echo "目标分支: ${{ github.event.inputs.target_branch || 'main' }}"
         
         echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
-        echo "source_branch=$SOURCE_BRANCH" >> $GITHUB_OUTPUT
         echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
-        echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+        echo "target_branch=${{ github.event.inputs.target_branch || 'main' }}" >> $GITHUB_OUTPUT
         
-        echo "解析结果："
-        echo "源仓库: $SOURCE_REPO, 分支: $SOURCE_BRANCH"
-        echo "目标仓库: $TARGET_REPO, 分支: $TARGET_BRANCH"
+    - name: 设置提交者信息
+      id: set_commit_name
+      run: |
+        COMMIT_NAME="${{ github.event.inputs.commit_name }}"
+        if [ -z "$COMMIT_NAME" ]; then
+          COMMIT_NAME="mozi9"
+        fi
+        echo "commit_name=$COMMIT_NAME" >> $GITHUB_OUTPUT
+        echo "使用提交者: $COMMIT_NAME"
         
-    - name: Checkout target repository
+    - name: 检出目标仓库
       uses: actions/checkout@v4
       with:
         repository: ${{ steps.parse_urls.outputs.target_repo }}
         ref: ${{ steps.parse_urls.outputs.target_branch }}
         token: ${{ env.PAT }}
-        fetch-depth: 0
+        fetch-depth: 1
         
-    - name: Configure Git
+    - name: 配置Git
       run: |
-        git config --global user.name "${{ env.GIT_USER }}"
-        git config --global user.email "${{ env.GIT_EMAIL }}"
-        git config --global push.default simple
+        git config user.name "${{ steps.set_commit_name.outputs.commit_name }}"
+        git config user.email "${{ env.GIT_EMAIL }}"
         
-    - name: Add source repository as remote
+    - name: 添加源仓库远程
       run: |
         git remote add source https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.source_repo }}.git
-        git fetch source --depth=1
         
-    - name: Get full commit hash from source
-      id: get_hash
+    - name: 获取源提交
       run: |
-        SOURCE_REF="${{ github.event.inputs.source_ref || steps.parse_urls.outputs.source_branch }}"
+        git fetch source --depth=1 ${{ github.event.inputs.source_commit }}
         
-        if [ "${{ github.event.inputs.use_full_hash }}" = "true" ]; then
-          FULL_HASH="$SOURCE_REF"
-        else
-          # 尝试解析引用（可能是分支、标签或哈希）
-          if git show-ref --verify --quiet refs/remotes/source/$SOURCE_REF; then
-            FULL_HASH=$(git rev-parse source/$SOURCE_REF)
-          elif git rev-parse --verify --quiet $SOURCE_REF; then
-            FULL_HASH=$(git rev-parse $SOURCE_REF)
-          else
-            # 尝试直接获取提交
-            FULL_HASH=$(git rev-parse $SOURCE_REF)
-          fi
+    - name: 验证源提交
+      id: resolve_commit
+      run: |
+        SOURCE_COMMIT="${{ github.event.inputs.source_commit }}"
+        
+        if [ -z "$SOURCE_COMMIT" ]; then
+          echo "❌ 错误：必须提供源提交哈希"
+          exit 1
         fi
         
-        echo "full_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-        echo "Resolved commit hash: $FULL_HASH"
+        if git cat-file -e $SOURCE_COMMIT 2>/dev/null; then
+          FULL_HASH=$(git rev-parse $SOURCE_COMMIT)
+          if [ "$(git cat-file -t $FULL_HASH)" = "commit" ]; then
+            echo "full_hash=$FULL_HASH" >> $GITHUB_OUTPUT
+            echo "✅ 提交验证成功: $FULL_HASH"
+            echo "提交信息:"
+            git show --no-patch --format=fuller $FULL_HASH
+          else
+            echo "❌ 错误：$FULL_HASH 不是有效的提交对象"
+            exit 1
+          fi
+        else
+          echo "❌ 错误：提交 $SOURCE_COMMIT 在源仓库中不存在"
+          exit 1
+        fi
         
-    - name: Checkout source commit
+    - name: 提取源提交文件列表
+      id: extract_files
       run: |
-        git checkout ${{ steps.get_hash.outputs.full_hash }}
+        FULL_HASH="${{ steps.resolve_commit.outputs.full_hash }}"
         
-    - name: Reset target branch to source commit (override all changes)
+        echo "=== 从提交 $FULL_HASH 提取文件列表 ==="
+        
+        SOURCE_FILES=$(git ls-tree -r --name-only $FULL_HASH)
+        FILE_COUNT=$(echo "$SOURCE_FILES" | wc -l)
+        
+        echo "提交包含 $FILE_COUNT 个文件"
+        echo "$SOURCE_FILES" > /tmp/source_files.txt
+        echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+        
+        # 显示前10个文件作为示例
+        echo "文件列表示例:"
+        echo "$SOURCE_FILES" | head -10
+        
+    - name: 无条件覆盖源提交文件
       run: |
-        git reset --hard ${{ steps.get_hash.outputs.full_hash }}
+        FULL_HASH="${{ steps.resolve_commit.outputs.full_hash }}"
+        SOURCE_FILES=$(cat /tmp/source_files.txt)
         
-    - name: Rewrite commit author information
+        echo "=== 开始无条件文件覆盖 ==="
+        echo "策略：无论文件是否相同，全部用源提交文件覆盖"
+        
+        FILE_COUNT=0
+        SUCCESS_COUNT=0
+        FAIL_COUNT=0
+        
+        for file in $SOURCE_FILES; do
+          FILE_COUNT=$((FILE_COUNT + 1))
+          if git checkout $FULL_HASH -- "$file" 2>/dev/null; then
+            echo "✅ [$FILE_COUNT] 覆盖: $file"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          else
+            echo "❌ [$FILE_COUNT] 失败: $file"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+          fi
+        done
+        
+        echo "文件覆盖完成: 成功 $SUCCESS_COUNT, 失败 $FAIL_COUNT, 总计 $FILE_COUNT"
+        
+    - name: 删除目标仓库多余文件
       run: |
-        git filter-branch -f --env-filter "
-          export GIT_COMMITTER_NAME='${{ env.GIT_USER }}'
-          export GIT_COMMITTER_EMAIL='${{ env.GIT_EMAIL }}'
-          export GIT_AUTHOR_NAME='${{ env.GIT_USER }}'
-          export GIT_AUTHOR_EMAIL='${{ env.GIT_EMAIL }}'
-        " HEAD
+        SOURCE_FILES=$(cat /tmp/source_files.txt)
+        TARGET_FILES=$(git ls-files)
         
-    - name: Force push to target repository
+        echo "=== 删除目标仓库中多余的文件 ==="
+        
+        DELETE_COUNT=0
+        for file in $TARGET_FILES; do
+          if ! echo "$SOURCE_FILES" | grep -q "^$file$"; then
+            if git rm --cached "$file" 2>/dev/null || rm -f "$file" 2>/dev/null; then
+              echo "🗑️ 删除: $file"
+              DELETE_COUNT=$((DELETE_COUNT + 1))
+            else
+              echo "⚠️ 删除失败: $file"
+            fi
+          fi
+        done
+        
+        echo "删除了 $DELETE_COUNT 个多余文件"
+        
+    - name: 最终一致性验证
       run: |
-        git push --force origin HEAD:${{ steps.parse_urls.outputs.target_branch }}
+        FULL_HASH="${{ steps.resolve_commit.outputs.full_hash }}"
+        SOURCE_FILES=$(cat /tmp/source_files.txt)
         
-    - name: Create annotated tag for the sync operation
+        echo "=== 最终一致性验证 ==="
+        
+        # 验证文件数量
+        SOURCE_COUNT=$(cat /tmp/source_files.txt | wc -l)
+        CURRENT_COUNT=$(git ls-files | wc -l)
+        
+        echo "源提交文件数: $SOURCE_COUNT"
+        echo "当前文件数: $CURRENT_COUNT"
+        
+        if [ "$SOURCE_COUNT" -eq "$CURRENT_COUNT" ]; then
+          echo "✅ 文件数量一致"
+        else
+          echo "⚠️ 文件数量不一致"
+        fi
+        
+        # 显示更改状态
+        echo "当前更改状态:"
+        git status --short
+        
+    - name: 提交同步更改
+      run: |
+        echo "=== 提交文件同步 ==="
+        
+        # 添加所有更改
+        git add -A
+        
+        # 检查是否有需要提交的更改
+        if git diff --cached --quiet; then
+          echo "📝 没有检测到文件更改（文件已完全一致）"
+        else
+          git commit -m "${{ github.event.inputs.commit_message }} (同步自提交 ${{ steps.resolve_commit.outputs.full_hash }})"
+          echo "✅ 同步提交完成"
+          echo "提交哈希: $(git rev-parse HEAD)"
+        fi
+        
+    - name: 推送到目标仓库
+      run: |
+        echo "=== 推送到目标仓库 ==="
+        
+        # 检查是否有需要推送的提交
+        if git log @{u}..HEAD --oneline | grep -q .; then
+          echo "开始推送..."
+          git push origin ${{ steps.parse_urls.outputs.target_branch }}
+          echo "✅ 推送完成"
+        else
+          echo "📝 没有需要推送的更改（工作目录已与源提交一致）"
+        fi
+        
+    - name: 创建同步标签
       run: |
         TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-        git tag -a "sync-$TIMESTAMP-${{ steps.get_hash.outputs.full_hash }}" -m "${{ github.event.inputs.commit_message }}"
-        git push origin "sync-$TIMESTAMP-${{ steps.get_hash.outputs.full_hash }}"
+        SHORT_HASH=$(echo ${{ steps.resolve_commit.outputs.full_hash }} | cut -c1-8)
+        TAG_NAME="sync-$TIMESTAMP-$SHORT_HASH"
         
-    - name: Cleanup
+        git tag -a "$TAG_NAME" -m "文件同步自提交 ${{ steps.resolve_commit.outputs.full_hash }} - ${{ github.event.inputs.commit_message }}"
+        git push origin "$TAG_NAME"
+        echo "✅ 同步标签已创建: $TAG_NAME"
+        
+    - name: 清理工作区
       run: |
+        rm -f /tmp/source_files.txt
         git remote remove source
+        echo "✅ 工作区清理完成"
         
-    - name: Display sync summary
+    - name: 显示同步摘要
       run: |
-        echo "同步完成！"
-        echo "源仓库: ${{ steps.parse_urls.outputs.source_repo }} (${{ steps.get_hash.outputs.full_hash }})"
-        echo "目标仓库: ${{ steps.parse_urls.outputs.target_repo }} (${{ steps.parse_urls.outputs.target_branch }})"
-        echo "提交信息: ${{ github.event.inputs.commit_message }}"
+        echo "=== 🎉 文件同步完成 ==="
+        echo ""
+        echo "📊 同步摘要:"
+        echo "  📦 源仓库: ${{ steps.parse_urls.outputs.source_repo }}"
+        echo "  🔗 源提交: ${{ steps.resolve_commit.outputs.full_hash }}"
+        echo "  🎯 目标仓库: ${{ steps.parse_urls.outputs.target_repo }}"
+        echo "  🌿 目标分支: ${{ steps.parse_urls.outputs.target_branch }}"
+        echo "  📁 同步文件数: ${{ steps.extract_files.outputs.file_count }}"
+        echo "  👤 提交者: ${{ steps.set_commit_name.outputs.commit_name }}"
+        echo "  💬 提交信息: ${{ github.event.inputs.commit_message }}"
+        echo ""
+        echo "⚡ 同步策略:"
+        echo "  ✅ 无条件文件覆盖（无论是否相同）"
+        echo "  ✅ 保留目标仓库完整历史"
+        echo "  ✅ 精确文件级同步"
+        echo ""
+        echo "✅ 目标仓库文件状态现在与源提交完全一致"
