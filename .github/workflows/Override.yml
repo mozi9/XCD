@@ -1,375 +1,249 @@
-name: Repository File Sync
+name: Delete Files from Commits - Mozi9 Identity
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址 (格式: owner/repo 或完整URL)'
+        description: '源仓库地址 (格式: owner/repo)'
         required: true
-        default: 'https://github.com/owner/source-repo'
-      source_commits:
-        description: '源提交哈希列表 (逗号分隔的短哈希或完整哈希)'
-        required: true
-        default: ''
+        default: 'owner/source-repo'
       target_repo:
-        description: '目标仓库地址 (格式: owner/repo 或完整URL)'
+        description: '目标仓库地址 (格式: owner/repo)'
         required: true
-        default: 'https://github.com/owner/target-repo'
+        default: 'owner/target-repo'
+      source_branch:
+        description: '源分支名'
+        required: true
+        default: 'main'
       target_branch:
         description: '目标分支名'
-        required: false
-        default: 'main'
-      commit_name:
-        description: '提交显示名称 (留空使用默认mozi9)'
-        required: false
-        default: ''
-      commit_message:
-        description: '提交信息'
         required: true
-        default: 'Sync from source repository'
-      sync_author_name:
-        description: '同步提交作者名 (留空使用默认mozi9)'
-        required: false
-        default: ''
-      sync_author_email:
-        description: '同步提交作者邮箱 (留空使用默认mozi9)'
-        required: false
-        default: ''
+        default: 'main'
+      commit_hashes:
+        description: '提交哈希（多个用逗号分隔）'
+        required: true
+        default: 'abc123,def456'
+      commit_message:
+        description: '删除操作的提交信息'
+        required: true
+        default: 'chore: 删除提交中的文件'
+      max_commits:
+        description: '最大处理提交数量'
+        required: true
+        default: '50'
 
 env:
-  PAT: ${{ secrets.MOZI9_PAT }}
-  GIT_USER: 'mozi9'
-  GIT_EMAIL: 'mozi9'
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  sync-repo:
+  delete-files-from-commits:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: 解析仓库地址
-      id: parse_urls
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ secrets.Mozi9_PAT }}
+        ref: ${{ github.event.inputs.target_branch }}
+        fetch-depth: 0
+
+    - name: Add source repository as remote
       run: |
-        extract_repo() {
-          local url="$1"
-          if [[ $url == http* ]] && [[ $url == *"github.com"* ]]; then
-            echo "$url" | sed -n 's|.*github.com/\([^/]*/[^/?]*\).*|\1|p'
-          else
-            echo "$url"
-          fi
-        }
-        
-        SOURCE_REPO=$(extract_repo "${{ github.event.inputs.source_repo }}")
-        TARGET_REPO=$(extract_repo "${{ github.event.inputs.target_repo }}")
-        
-        echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
-        echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
-        echo "target_branch=${{ github.event.inputs.target_branch || 'main' }}" >> $GITHUB_OUTPUT
-        
-    - name: 设置提交者信息
-      id: set_commit_info
+        echo "🔗 添加源仓库..."
+        git remote add source-repo https://github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source-repo ${{ github.event.inputs.source_branch }} --depth=100
+        echo "✅ 源仓库添加完成"
+
+    - name: Setup Mozi9 Git identity
       run: |
-        COMMIT_NAME="${{ github.event.inputs.commit_name }}"
-        if [ -z "$COMMIT_NAME" ]; then
-          COMMIT_NAME="mozi9"
-        fi
-        echo "commit_name=$COMMIT_NAME" >> $GITHUB_OUTPUT
-        
-        AUTHOR_NAME="${{ github.event.inputs.sync_author_name }}"
-        if [ -z "$AUTHOR_NAME" ]; then
-          AUTHOR_NAME="mozi9"
-        fi
-        echo "author_name=$AUTHOR_NAME" >> $GITHUB_OUTPUT
-        
-        AUTHOR_EMAIL="${{ github.event.inputs.sync_author_email }}"
-        if [ -z "$AUTHOR_EMAIL" ]; then
-          AUTHOR_EMAIL="mozi9"
-        fi
-        echo "author_email=$AUTHOR_EMAIL" >> $GITHUB_OUTPUT
-        
-    - name: 克隆源仓库
+        echo "⚙️ 配置 Mozi9 Git 身份..."
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
+        git config --global push.default simple
+        echo "✅ Git身份已设置为: mozi9 <mozi9>"
+
+    - name: Parse and validate commit hashes
+      id: parse_commits
       run: |
-        echo "克隆源仓库..."
-        git clone https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.source_repo }}.git /tmp/source_repo
-        cd /tmp/source_repo
-        echo "✅ 源仓库克隆完成"
-        
-    - name: 验证提交哈希
-      id: validate_commits
-      run: |
-        cd /tmp/source_repo
-        COMMITS_INPUT="${{ github.event.inputs.source_commits }}"
-        
-        if [ -z "$COMMITS_INPUT" ]; then
-          echo "❌ 错误：必须提供源提交哈希列表"
-          exit 1
-        fi
-        
-        CLEANED_COMMITS=$(echo "$COMMITS_INPUT" | tr -d '[:space:]')
-        IFS=',' read -ra COMMIT_ARRAY <<< "$CLEANED_COMMITS"
-        
-        echo "解析到 ${#COMMIT_ARRAY[@]} 个提交哈希: ${COMMIT_ARRAY[*]}"
+        echo "🔍 验证提交哈希..."
+        COMMIT_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' ' ')
         
         VALID_COMMITS=()
-        for commit in "${COMMIT_ARRAY[@]}"; do
-          if [ -n "$commit" ]; then
-            if git cat-file -e $commit 2>/dev/null; then
-              FULL_HASH=$(git rev-parse $commit)
-              if [ "$(git cat-file -t $FULL_HASH)" = "commit" ]; then
-                VALID_COMMITS+=("$FULL_HASH")
-                echo "✅ 验证提交: $commit -> $FULL_HASH"
-              else
-                echo "❌ 无效提交对象: $commit"
-              fi
-            else
-              echo "❌ 提交不存在: $commit"
-            fi
+        INVALID_COMMITS=()
+        
+        for commit in $COMMIT_HASHES; do
+          if git rev-parse --verify "$commit" >/dev/null 2>&1; then
+            COMMIT_SUBJECT=$(git log -1 --format="%s" "$commit" 2>/dev/null || echo "无法获取提交信息")
+            echo "✅ 提交有效: $commit - $COMMIT_SUBJECT"
+            VALID_COMMITS+=("$commit")
+          else
+            echo "❌ 提交无效: $commit"
+            INVALID_COMMITS+=("$commit")
           fi
         done
         
         if [ ${#VALID_COMMITS[@]} -eq 0 ]; then
-          echo "❌ 错误：没有找到有效的提交"
+          echo "❌ 错误: 没有找到有效的提交"
           exit 1
         fi
         
-        COMMITS_CSV=$(IFS=','; echo "${VALID_COMMITS[*]}")
-        echo "commits_csv=$COMMITS_CSV" >> $GITHUB_OUTPUT
-        echo "commits_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
+        # 限制提交数量
+        MAX_COMMITS=${{ github.event.inputs.max_commits }}
+        if [ ${#VALID_COMMITS[@]} -gt $MAX_COMMITS ]; then
+          echo "⚠️ 警告: 提交数量 ${#VALID_COMMITS[@]} 超过最大限制 $MAX_COMMITS"
+          VALID_COMMITS=("${VALID_COMMITS[@]:0:$MAX_COMMITS}")
+        fi
         
-    - name: 获取提交中的文件列表
-      id: get_commit_files
+        printf "%s\n" "${VALID_COMMITS[@]}" > /tmp/valid_commits.txt
+        echo "commit_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
+        echo "📊 将处理 ${#VALID_COMMITS[@]} 个有效提交"
+
+    - name: Extract files from source commits
+      id: extract_files
       run: |
-        cd /tmp/source_repo
+        echo "📁 从源提交提取文件列表..."
+        COMMITS=$(cat /tmp/valid_commits.txt)
         
-        IFS=',' read -ra COMMIT_HASHES <<< "${{ steps.validate_commits.outputs.commits_csv }}"
+        ALL_FILES=""
         
-        ALL_FILES=()
-        DELETED_FILES=()
-        
-        for commit_hash in "${COMMIT_HASHES[@]}"; do
-          echo "处理提交: $commit_hash"
+        for COMMIT in $COMMITS; do
+          echo "📝 分析提交: $COMMIT"
           
-          # 获取该提交中修改的文件列表
-          FILES_IN_COMMIT=$(git show --name-only --format=format: $commit_hash | grep -v '^$' || true)
+          # 获取提交中的所有文件（包括新增、修改、删除的文件）
+          COMMIT_FILES=$(git show --name-only --format= "$COMMIT" 2>/dev/null | grep -v '^$' || true)
           
-          # 获取该提交中状态变更的文件（包括删除的文件）
-          FILES_WITH_STATUS=$(git show --name-status --format=format: $commit_hash | tail -n +2 || true)
-          
-          if [ -n "$FILES_IN_COMMIT" ]; then
-            while IFS= read -r file; do
-              if [ -n "$file" ]; then
-                ALL_FILES+=("$file")
-                echo "📄 找到文件: $file"
-              fi
-            done <<< "$FILES_IN_COMMIT"
-          fi
-          
-          if [ -n "$FILES_WITH_STATUS" ]; then
-            while IFS= read -r line; do
-              if [ -n "$line" ]; then
-                STATUS=$(echo "$line" | awk '{print $1}')
-                FILE=$(echo "$line" | awk '{for(i=2;i<=NF;i++) printf "%s", $i (i==NF?ORS:OFS)}')
-                
-                if [ "$STATUS" = "D" ] || [ "$STATUS" = "D000" ]; then
-                  DELETED_FILES+=("$FILE")
-                  echo "🗑️  标记为删除的文件: $FILE"
-                fi
-              fi
-            done <<< "$FILES_WITH_STATUS"
+          if [ -n "$COMMIT_FILES" ]; then
+            FILE_COUNT_IN_COMMIT=$(echo "$COMMIT_FILES" | wc -l)
+            echo "  包含文件: $FILE_COUNT_IN_COMMIT 个"
+            ALL_FILES="$ALL_FILES"$'\n'"$COMMIT_FILES"
+          else
+            echo "  ℹ️ 提交中没有文件变更"
           fi
         done
         
-        # 去重文件列表
-        UNIQUE_FILES=($(printf "%s\n" "${ALL_FILES[@]}" | sort -u))
-        UNIQUE_DELETED=($(printf "%s\n" "${DELETED_FILES[@]}" | sort -u))
+        # 去重并排序
+        UNIQUE_FILES=$(echo "$ALL_FILES" | sort | uniq | grep -v '^$')
+        UNIQUE_COUNT=$(echo "$UNIQUE_FILES" | wc -l)
         
-        echo "总共找到 ${#UNIQUE_FILES[@]} 个唯一文件"
-        echo "总共找到 ${#UNIQUE_DELETED[@]} 个唯一删除文件"
-        
-        # 将文件列表转换为JSON格式存储
-        echo "files_json=$(printf '%s\n' "${UNIQUE_FILES[@]}" | jq -R -s -c 'split("\n") | map(select(. != ""))')" >> $GITHUB_OUTPUT
-        echo "deleted_files_json=$(printf '%s\n' "${UNIQUE_DELETED[@]}" | jq -R -s -c 'split("\n") | map(select(. != ""))')" >> $GITHUB_OUTPUT
-        
-        # 也保存为逗号分隔的字符串（用于日志显示）
-        echo "files_list=$(IFS=','; echo "${UNIQUE_FILES[*]}")" >> $GITHUB_OUTPUT
-        echo "deleted_files_list=$(IFS=','; echo "${UNIQUE_DELETED[*]}")" >> $GITHUB_OUTPUT
-        
-    - name: 显示文件统计信息
+        echo "$UNIQUE_FILES" > /tmp/files_from_commits.txt
+        echo "📊 提取完成: 去重后文件数: $UNIQUE_COUNT"
+        echo "unique_file_count=$UNIQUE_COUNT" >> $GITHUB_OUTPUT
+
+    - name: Delete files from target repository
+      id: delete_files
       run: |
-        echo "📊 文件统计信息:"
-        echo "有效文件数量: $(echo '${{ steps.get_commit_files.outputs.files_json }}' | jq length)"
-        echo "删除文件数量: $(echo '${{ steps.get_commit_files.outputs.deleted_files_json }}' | jq length)"
+        echo "🗑️ 从目标仓库删除文件..."
+        FILES_TO_DELETE=$(cat /tmp/files_from_commits.txt)
         
-        echo "有效文件列表:"
-        echo "${{ steps.get_commit_files.outputs.files_list }}"
+        DELETED_COUNT=0
+        FAILED_COUNT=0
+        NOT_FOUND_COUNT=0
         
-        echo "删除文件列表:"
-        echo "${{ steps.get_commit_files.outputs.deleted_files_list }}"
-        
-    - name: 克隆目标仓库
-      run: |
-        echo "克隆目标仓库..."
-        git clone https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.target_repo }}.git /tmp/target_repo
-        cd /tmp/target_repo
-        
-        # 切换到目标分支，如果不存在则创建
-        git checkout ${{ steps.parse_urls.outputs.target_branch }} 2>/dev/null || git checkout -b ${{ steps.parse_urls.outputs.target_branch }}
-        echo "✅ 目标仓库克隆完成"
-        
-    - name: 同步文件到目标仓库
-      id: sync_files
-      run: |
-        cd /tmp/target_repo
-        
-        # 从JSON中解析文件列表
-        FILES_JSON='${{ steps.get_commit_files.outputs.files_json }}'
-        DELETED_FILES_JSON='${{ steps.get_commit_files.outputs.deleted_files_json }}'
-        
-        # 使用jq解析JSON数组
-        FILES_ARRAY=$(echo "$FILES_JSON" | jq -r '.[]' 2>/dev/null || echo "")
-        DELETED_ARRAY=$(echo "$DELETED_FILES_JSON" | jq -r '.[]' 2>/dev/null || echo "")
-        
-        echo "开始同步文件..."
-        
-        SYNC_COUNT=0
-        DELETE_COUNT=0
-        SKIP_COUNT=0
-        ERROR_COUNT=0
-        
-        # 同步新增/修改的文件 - 强制覆盖策略
-        if [ -n "$FILES_ARRAY" ]; then
-          while IFS= read -r file; do
-            if [ -n "$file" ]; then
-              # 创建目标目录（如果不存在）
-              FILE_DIR=$(dirname "$file")
-              if [ "$FILE_DIR" != "." ]; then
-                mkdir -p "$FILE_DIR"
-              fi
-              
-              # 检查源文件是否存在
-              if [ ! -f "/tmp/source_repo/$file" ]; then
-                echo "⚠️  警告: 源文件不存在 /tmp/source_repo/$file"
-                ERROR_COUNT=$((ERROR_COUNT + 1))
-                continue
-              fi
-              
-              # 检查目标文件是否存在
-              if [ -f "$file" ]; then
-                # 检查文件内容是否相同
-                if cmp -s "/tmp/source_repo/$file" "$file"; then
-                  echo "✅ 文件内容相同，跳过: $file"
-                  SKIP_COUNT=$((SKIP_COUNT + 1))
-                else
-                  # 文件内容不同，强制覆盖
-                  cp "/tmp/source_repo/$file" "$file"
-                  SYNC_COUNT=$((SYNC_COUNT + 1))
-                  echo "🔄 文件内容冲突，已覆盖: $file"
-                fi
-              else
-                # 目标文件不存在，直接复制
-                cp "/tmp/source_repo/$file" "$file"
-                SYNC_COUNT=$((SYNC_COUNT + 1))
-                echo "📄 新增文件: $file"
-              fi
+        for file in $FILES_TO_DELETE; do
+          if [ ! -e "$file" ]; then
+            NOT_FOUND_COUNT=$((NOT_FOUND_COUNT + 1))
+            continue
+          fi
+          
+          if [ -f "$file" ]; then
+            if rm -f "$file"; then
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              FAILED_COUNT=$((FAILED_COUNT + 1))
             fi
-          done <<< "$FILES_ARRAY"
-        fi
-        
-        # 处理删除的文件
-        if [ -n "$DELETED_ARRAY" ]; then
-          while IFS= read -r file; do
-            if [ -n "$file" ]; then
-              if [ -f "$file" ] || [ -d "$file" ]; then
-                rm -rf "$file"
-                DELETE_COUNT=$((DELETE_COUNT + 1))
-                echo "🗑️  已删除文件: $file"
-              else
-                echo "ℹ️  文件不存在，无需删除: $file"
-                SKIP_COUNT=$((SKIP_COUNT + 1))
-              fi
+          elif [ -d "$file" ]; then
+            if rm -rf "$file"; then
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              FAILED_COUNT=$((FAILED_COUNT + 1))
             fi
-          done <<< "$DELETED_ARRAY"
-        fi
+          fi
+        done
         
-        echo "sync_count=$SYNC_COUNT" >> $GITHUB_OUTPUT
-        echo "delete_count=$DELETE_COUNT" >> $GITHUB_OUTPUT
-        echo "skip_count=$SKIP_COUNT" >> $GITHUB_OUTPUT
-        echo "error_count=$ERROR_COUNT" >> $GITHUB_OUTPUT
+        echo "📊 删除操作完成:"
+        echo "  成功删除: $DELETED_COUNT 个"
+        echo "  删除失败: $FAILED_COUNT 个"
+        echo "  文件不存在: $NOT_FOUND_COUNT 个"
         
-        echo "📊 同步完成统计:"
-        echo "   新增/修改文件: $SYNC_COUNT"
-        echo "   删除文件: $DELETE_COUNT"
-        echo "   跳过文件: $SKIP_COUNT"
-        echo "   错误文件: $ERROR_COUNT"
-        
-    - name: 检查是否有文件变更
-      id: check_changes
+        echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+        echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+        echo "not_found_count=$NOT_FOUND_COUNT" >> $GITHUB_OUTPUT
+
+    - name: Stage changes in Git
+      id: stage_changes
       run: |
-        cd /tmp/target_repo
-        
-        if git diff --quiet && git diff --cached --quiet; then
-          echo "📝 没有检测到文件变更"
-          echo "has_changes=false" >> $GITHUB_OUTPUT
-        else
-          echo "📝 检测到文件变更"
-          git status
-          git diff --name-status
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-        fi
-        
-    - name: 提交变更到目标仓库
-      if: steps.check_changes.outputs.has_changes == 'true'
-      run: |
-        cd /tmp/target_repo
-        
-        # 配置git用户信息
-        git config user.name "${{ steps.set_commit_info.outputs.author_name }}"
-        git config user.email "${{ steps.set_commit_info.outputs.author_email }}"
-        
-        # 添加所有变更
+        echo "📦 暂存变更到 Git..."
         git add -A
         
-        # 提交变更
-        COMMIT_MESSAGE="${{ github.event.inputs.commit_message }}"
-        if [ -z "$COMMIT_MESSAGE" ]; then
-          COMMIT_MESSAGE="Sync files from ${{ steps.parse_urls.outputs.source_repo }}"
+        STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+        if [ "$STAGED_COUNT" -eq 0 ]; then
+          echo "ℹ️ 没有检测到文件变更"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "✅ 检测到 $STAGED_COUNT 个文件变更"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Commit changes as Mozi9
+      id: commit_changes
+      if: steps.stage_changes.outputs.has_changes == 'true'
+      run: |
+        echo "💾 创建提交..."
+        
+        # 只使用用户提供的提交信息，不添加额外报告
+        COMMIT_MSG="${{ github.event.inputs.commit_message }}"
+        
+        # 简洁的提交
+        git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
+        
+        echo "✅ 提交创建完成"
+        echo "commit_hash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+    - name: Push changes with Mozi9 token
+      id: push_changes
+      if: steps.stage_changes.outputs.has_changes == 'true'
+      run: |
+        echo "🚀 推送到远程仓库..."
+        
+        CURRENT_BRANCH=$(git branch --show-current)
+        TARGET_REPO="${{ github.event.inputs.target_repo }}"
+        
+        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/$TARGET_REPO.git $CURRENT_BRANCH
+        
+        echo "✅ 推送完成"
+
+    - name: Generate final report
+      run: |
+        echo ""
+        echo "🎉 根据提交删除文件流程完成!"
+        echo "=========================================="
+        echo "📊 执行报告:"
+        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "  处理提交: ${{ steps.parse_commits.outputs.commit_count }} 个"
+        echo "  提取文件: ${{ steps.extract_files.outputs.unique_file_count }} 个(去重后)"
+        echo "  成功删除: ${{ steps.delete_files.outputs.deleted_count || 0 }} 个"
+        echo "  文件不存在: ${{ steps.delete_files.outputs.not_found_count || 0 }} 个"
+        echo "  删除失败: ${{ steps.delete_files.outputs.failed_count || 0 }} 个"
+        
+        if [ "${{ steps.stage_changes.outputs.has_changes }}" = "true" ]; then
+          echo "  Git 提交: ✅ 已创建"
+          echo "  提交信息: ${{ github.event.inputs.commit_message }}"
+          echo "  推送状态: ✅ 已推送"
+        else
+          echo "  Git 提交: ℹ️ 无变更"
+          echo "  推送状态: ℹ️ 无需推送"
         fi
         
-        # 添加提交详情
-        COMMIT_DETAILS="\n\n同步详情:\n- 源仓库: ${{ steps.parse_urls.outputs.source_repo }}\n- 提交哈希: ${{ github.event.inputs.source_commits }}\n- 同步文件数: ${{ steps.sync_files.outputs.sync_count }}\n- 删除文件数: ${{ steps.sync_files.outputs.delete_count }}\n- 跳过文件数: ${{ steps.sync_files.outputs.skip_count }}\n- 错误数: ${{ steps.sync_files.outputs.error_count }}"
+        echo ""
+        echo "📋 处理的提交列表:"
+        cat /tmp/valid_commits.txt | while read commit; do
+          if [ -n "$commit" ]; then
+            SUBJECT=$(git log -1 --format="%s" "$commit" 2>/dev/null || echo "未知提交")
+            echo "  $commit - $SUBJECT"
+          fi
+        done
         
-        git commit -m "${COMMIT_MESSAGE}${COMMIT_DETAILS}"
-        
-        echo "✅ 变更已提交"
-        
-    - name: 推送变更到目标仓库
-      if: steps.check_changes.outputs.has_changes == 'true'
-      run: |
-        cd /tmp/target_repo
-        
-        echo "推送变更到目标仓库..."
-        git push origin ${{ steps.parse_urls.outputs.target_branch }}
-        
-        echo "🎉 同步完成！"
-        echo "📊 最终统计:"
-        echo "   新增/修改文件: ${{ steps.sync_files.outputs.sync_count }}"
-        echo "   删除文件: ${{ steps.sync_files.outputs.delete_count }}"
-        echo "   跳过文件: ${{ steps.sync_files.outputs.skip_count }}"
-        echo "   错误文件: ${{ steps.sync_files.outputs.error_count }}"
-        
-    - name: 显示无变更信息
-      if: steps.check_changes.outputs.has_changes == 'false'
-      run: |
-        echo "ℹ️  没有检测到文件变更，跳过提交和推送"
-        echo "📊 处理统计:"
-        echo "   新增/修改文件: ${{ steps.sync_files.outputs.sync_count }}"
-        echo "   删除文件: ${{ steps.sync_files.outputs.delete_count }}"
-        echo "   跳过文件: ${{ steps.sync_files.outputs.skip_count }}"
-        echo "   错误文件: ${{ steps.sync_files.outputs.error_count }}"
-        
-    - name: 清理工作目录
-      if: always()
-      run: |
-        echo "🧹 清理临时文件..."
-        rm -rf /tmp/source_repo
-        rm -rf /tmp/target_repo
-        echo "✅ 清理完成"
+        echo ""
+        echo "⏰ 完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "=========================================="
