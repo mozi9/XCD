@@ -1,79 +1,150 @@
-name: Exact Source Commit Apply - No Reset
+name: Source Commit Sync with Author Processing
 
 on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址 (格式: owner/repo)'
+        description: '源仓库地址'
         required: true
-        default: 'mozi9/source-repo'
+        default: 'owner/source-repo'
+      source_branch:
+        description: '源分支名'
+        required: true
+        default: 'main'
       target_repo:
-        description: '目标仓库地址 (格式: owner/repo)'
+        description: '目标仓库地址'
         required: true
-        default: 'mozi9/target-repo'
+        default: 'owner/target-repo'
+      target_branch:
+        description: '目标分支名'
+        required: true
+        default: 'main'
       commit_hashes:
-        description: '要同步的提交哈希（多个用逗号分隔）'
+        description: '要推送的提交哈希'
         required: true
         default: ''
-      commit_message:
-        description: '合并提交信息'
+      new_branch_name:
+        description: '新分支名（留空使用目标分支）'
+        required: false
+        default: ''
+      push_strategy:
+        description: '推送策略'
         required: true
-        default: 'sync: 同步提交'
+        default: 'new-branch'
+        type: choice
+        options:
+        - new-branch
+        - direct-push
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  exact-apply:
+  sync-with-author:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout target repository
+    - name: Checkout source repository
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.event.inputs.target_repo }}
+        repository: ${{ github.event.inputs.source_repo }}
         token: ${{ secrets.Mozi9_PAT }}
-        ref: 'main'
+        ref: ${{ github.event.inputs.source_branch }}
         fetch-depth: 0
 
-    - name: Setup Git identity
+    - name: Setup Mozi9 Git identity
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9"
+        echo "Git identity set to: mozi9 <mozi9>"
 
-    - name: Add source repository
+    - name: Add target repository
       run: |
-        git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
-        git fetch source
+        git remote add target https://github.com/${{ github.event.inputs.target_repo }}.git
+        git fetch target
 
-    - name: Create apply branch
+    - name: Create sync branch
+      id: create_branch
       run: |
-        git checkout -b apply-commits
+        if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
+          BRANCH_NAME="${{ github.event.inputs.target_branch }}"
+        else
+          BRANCH_NAME="${{ github.event.inputs.new_branch_name }}"
+        fi
+        git checkout -b sync-branch target/${{ github.event.inputs.target_branch }}
+        echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
 
-    - name: Apply commits exactly
+    - name: Process commits with author cleanup
+      id: process_commits
       run: |
-        echo "应用提交（完全保留源内容）..."
+        echo "处理提交（清理作者信息）..."
         COMMITS=$(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' ')
+        PROCESSED_COUNT=0
         
         for COMMIT in $COMMITS; do
-          echo "应用提交: $COMMIT"
+          echo "处理提交: $COMMIT"
           
-          # 直接使用 cherry-pick 应用提交
-          git cherry-pick $COMMIT
+          # 获取原始提交信息
+          ORIG_MSG=$(git log -1 --format=%B "$COMMIT")
+          ORIG_AUTHOR=$(git log -1 --format="%an <%ae>" "$COMMIT")
+          ORIG_DATE=$(git log -1 --format="%ci" "$COMMIT")
           
-          # 仅修改作者，保持所有内容不变
-          git commit --amend --author="mozi9 <mozi9>" --no-edit
+          echo "原始作者: $ORIG_AUTHOR"
+          echo "提交时间: $ORIG_DATE"
           
-          echo "✅ 提交应用完成"
+          # 清理提交信息中的作者相关行
+          CLEAN_MSG=$(echo "$ORIG_MSG" | \
+            grep -v -E "(Co-authored-by|Reviewed-by|Signed-off-by|Acked-by|Tested-by):" | \
+            grep -v "^$" | \
+            sed '/^[[:space:]]*$/d')
+          
+          echo "清理后的提交信息:"
+          echo "$CLEAN_MSG"
+          
+          # 应用提交
+          git cherry-pick "$COMMIT"
+          
+          # 修改作者信息为 mozi9
+          git commit --amend --author="mozi9 <mozi9>" --date="$ORIG_DATE" -m "$CLEAN_MSG"
+          
+          PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+          echo "✅ 提交处理完成（作者: mozi9）"
         done
+        
+        echo "processed_count=$PROCESSED_COUNT" >> $GITHUB_OUTPUT
 
-    - name: Merge to main
+    - name: Push with strategy
       run: |
-        git checkout main
-        git merge --no-ff -m "${{ github.event.inputs.commit_message }}" apply-commits
-        git commit --amend --author="mozi9 <mozi9>" --no-edit
+        BRANCH_NAME="${{ steps.create_branch.outputs.branch_name }}"
+        
+        case "${{ github.event.inputs.push_strategy }}" in
+          "new-branch")
+            echo "推送到新分支: $BRANCH_NAME"
+            git push target sync-branch:$BRANCH_NAME
+            ;;
+          "direct-push")
+            echo "直接推送到目标分支: $BRANCH_NAME"
+            git push target sync-branch:$BRANCH_NAME --force
+            ;;
+        esac
 
-    - name: Final report
+    - name: Generate report
       run: |
-        echo "✅ 提交应用完成"
-        echo "所有源提交内容已完全应用到目标仓库"
-        echo "作者信息已统一为: mozi9 <mozi9>"
+        echo ""
+        echo "🎉 提交同步完成!"
+        echo "=========================================="
+        echo "📊 执行结果:"
+        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "  目标分支: ${{ steps.create_branch.outputs.branch_name }}"
+        echo "  处理提交: ${{ steps.process_commits.outputs.processed_count }} 个"
+        echo ""
+        echo "✅ 作者信息处理:"
+        echo "  - 原始作者: 全部移除"
+        echo "  - Co-authored-by: 全部移除"
+        echo "  - Reviewed-by: 全部移除"
+        echo "  - Signed-off-by: 全部移除"
+        echo "  - 统一作者: mozi9 <mozi9>"
+        echo "  - 保留提交时间戳"
+        echo ""
+        echo "👤 最终作者: mozi9 <mozi9>"
+        echo "=========================================="
