@@ -7,8 +7,8 @@ on:
         description: '源仓库地址 (格式: owner/repo 或完整URL)'
         required: true
         default: 'https://github.com/owner/source-repo'
-      source_commit:
-        description: '源提交哈希 (短哈希或完整哈希)'
+      source_commits:
+        description: '源提交哈希列表 (逗号分隔的短哈希或完整哈希)'
         required: true
         default: ''
       target_repo:
@@ -27,6 +27,14 @@ on:
         description: '提交信息'
         required: true
         default: 'Sync from source repository'
+      sync_author_name:
+        description: '同步提交作者名 (留空使用默认mozi9)'
+        required: false
+        default: ''
+      sync_author_email:
+        description: '同步提交作者邮箱 (留空使用默认mozi9)'
+        required: false
+        default: ''
 
 env:
   PAT: ${{ secrets.MOZI9_PAT }}
@@ -41,7 +49,6 @@ jobs:
     - name: 解析仓库地址
       id: parse_urls
       run: |
-        # 提取仓库owner/repo
         extract_repo() {
           local url="$1"
           if [[ $url == http* ]] && [[ $url == *"github.com"* ]]; then
@@ -54,203 +61,330 @@ jobs:
         SOURCE_REPO=$(extract_repo "${{ github.event.inputs.source_repo }}")
         TARGET_REPO=$(extract_repo "${{ github.event.inputs.target_repo }}")
         
-        echo "源仓库: $SOURCE_REPO"
-        echo "目标仓库: $TARGET_REPO"
-        echo "目标分支: ${{ github.event.inputs.target_branch || 'main' }}"
-        
         echo "source_repo=$SOURCE_REPO" >> $GITHUB_OUTPUT
         echo "target_repo=$TARGET_REPO" >> $GITHUB_OUTPUT
         echo "target_branch=${{ github.event.inputs.target_branch || 'main' }}" >> $GITHUB_OUTPUT
         
     - name: 设置提交者信息
-      id: set_commit_name
+      id: set_commit_info
       run: |
+        # 设置提交显示名称
         COMMIT_NAME="${{ github.event.inputs.commit_name }}"
         if [ -z "$COMMIT_NAME" ]; then
           COMMIT_NAME="mozi9"
         fi
         echo "commit_name=$COMMIT_NAME" >> $GITHUB_OUTPUT
-        echo "使用提交者: $COMMIT_NAME"
         
-    - name: 检出目标仓库
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ steps.parse_urls.outputs.target_repo }}
-        ref: ${{ steps.parse_urls.outputs.target_branch }}
-        token: ${{ env.PAT }}
-        fetch-depth: 1
+        # 设置提交作者名
+        AUTHOR_NAME="${{ github.event.inputs.sync_author_name }}"
+        if [ -z "$AUTHOR_NAME" ]; then
+          AUTHOR_NAME="mozi9"
+        fi
+        echo "author_name=$AUTHOR_NAME" >> $GITHUB_OUTPUT
         
-    - name: 配置Git
+        # 设置提交作者邮箱
+        AUTHOR_EMAIL="${{ github.event.inputs.sync_author_email }}"
+        if [ -z "$AUTHOR_EMAIL" ]; then
+          AUTHOR_EMAIL="mozi9"
+        fi
+        echo "author_email=$AUTHOR_EMAIL" >> $GITHUB_OUTPUT
+        
+        echo "📝 提交信息配置:"
+        echo "  提交显示名称: $COMMIT_NAME"
+        echo "  提交作者名: $AUTHOR_NAME"
+        echo "  提交作者邮箱: $AUTHOR_EMAIL"
+        
+    - name: 创建临时工作目录
       run: |
-        git config user.name "${{ steps.set_commit_name.outputs.commit_name }}"
-        git config user.email "${{ env.GIT_EMAIL }}"
+        echo "创建临时工作目录..."
+        mkdir -p /tmp/sync_workspace
+        cd /tmp/sync_workspace
+        git init
+        git config user.name "${{ steps.set_commit_info.outputs.author_name }}"
+        git config user.email "${{ steps.set_commit_info.outputs.author_email }}"
         
     - name: 添加源仓库远程
       run: |
+        cd /tmp/sync_workspace
         git remote add source https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.source_repo }}.git
         
-    - name: 获取源提交
+    - name: 解析和验证提交列表
+      id: parse_commits
       run: |
-        git fetch source --depth=1 ${{ github.event.inputs.source_commit }}
+        cd /tmp/sync_workspace
+        COMMITS_INPUT="${{ github.event.inputs.source_commits }}"
         
-    - name: 验证源提交
-      id: resolve_commit
-      run: |
-        SOURCE_COMMIT="${{ github.event.inputs.source_commit }}"
-        
-        if [ -z "$SOURCE_COMMIT" ]; then
-          echo "❌ 错误：必须提供源提交哈希"
+        if [ -z "$COMMITS_INPUT" ]; then
+          echo "❌ 错误：必须提供源提交哈希列表"
           exit 1
         fi
         
-        if git cat-file -e $SOURCE_COMMIT 2>/dev/null; then
-          FULL_HASH=$(git rev-parse $SOURCE_COMMIT)
-          if [ "$(git cat-file -t $FULL_HASH)" = "commit" ]; then
-            echo "full_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-            echo "✅ 提交验证成功: $FULL_HASH"
-            echo "提交信息:"
-            git show --no-patch --format=fuller $FULL_HASH
-          else
-            echo "❌ 错误：$FULL_HASH 不是有效的提交对象"
-            exit 1
-          fi
-        else
-          echo "❌ 错误：提交 $SOURCE_COMMIT 在源仓库中不存在"
-          exit 1
-        fi
+        # 清理输入，分割为数组
+        CLEANED_COMMITS=$(echo "$COMMITS_INPUT" | tr -d '[:space:]')
+        IFS=',' read -ra COMMIT_ARRAY <<< "$CLEANED_COMMITS"
         
-    - name: 提取源提交文件列表
-      id: extract_files
-      run: |
-        FULL_HASH="${{ steps.resolve_commit.outputs.full_hash }}"
+        echo "解析到 ${#COMMIT_ARRAY[@]} 个提交哈希: ${COMMIT_ARRAY[*]}"
         
-        echo "=== 从提交 $FULL_HASH 提取文件列表 ==="
+        # 验证每个提交并获取完整哈希
+        VALID_COMMITS=()
         
-        SOURCE_FILES=$(git ls-tree -r --name-only $FULL_HASH)
-        FILE_COUNT=$(echo "$SOURCE_FILES" | wc -l)
-        
-        echo "提交包含 $FILE_COUNT 个文件"
-        echo "$SOURCE_FILES" > /tmp/source_files.txt
-        echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-        
-        # 显示前10个文件作为示例
-        echo "文件列表示例:"
-        echo "$SOURCE_FILES" | head -10
-        
-    - name: 无条件覆盖源提交文件
-      run: |
-        FULL_HASH="${{ steps.resolve_commit.outputs.full_hash }}"
-        SOURCE_FILES=$(cat /tmp/source_files.txt)
-        
-        echo "=== 开始无条件文件覆盖 ==="
-        echo "策略：无论文件是否相同，全部用源提交文件覆盖"
-        
-        FILE_COUNT=0
-        SUCCESS_COUNT=0
-        FAIL_COUNT=0
-        
-        for file in $SOURCE_FILES; do
-          FILE_COUNT=$((FILE_COUNT + 1))
-          if git checkout $FULL_HASH -- "$file" 2>/dev/null; then
-            echo "✅ [$FILE_COUNT] 覆盖: $file"
-            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-          else
-            echo "❌ [$FILE_COUNT] 失败: $file"
-            FAIL_COUNT=$((FAIL_COUNT + 1))
+        for commit in "${COMMIT_ARRAY[@]}"; do
+          if [ -n "$commit" ]; then
+            # 获取提交元数据（不下载文件内容）
+            if git fetch source --depth=1 $commit 2>/dev/null; then
+              if git cat-file -e $commit 2>/dev/null; then
+                FULL_HASH=$(git rev-parse $commit)
+                if [ "$(git cat-file -t $FULL_HASH)" = "commit" ]; then
+                  VALID_COMMITS+=("$FULL_HASH")
+                  echo "✅ 获取并验证提交: $commit -> $FULL_HASH"
+                else
+                  echo "❌ 无效提交对象: $commit"
+                fi
+              else
+                echo "❌ 提交不存在: $commit"
+              fi
+            else
+              echo "❌ 无法获取提交: $commit"
+            fi
           fi
         done
         
-        echo "文件覆盖完成: 成功 $SUCCESS_COUNT, 失败 $FAIL_COUNT, 总计 $FILE_COUNT"
+        if [ ${#VALID_COMMITS[@]} -eq 0 ]; then
+          echo "❌ 错误：没有找到有效的提交"
+          exit 1
+        fi
+        
+        COMMITS_CSV=$(IFS=','; echo "${VALID_COMMITS[*]}")
+        echo "commits_csv=$COMMITS_CSV" >> $GITHUB_OUTPUT
+        echo "commits_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
+        
+    - name: 从指定提交中提取文件列表（去重）
+      id: extract_files
+      run: |
+        cd /tmp/sync_workspace
+        IFS=',' read -ra COMMITS <<< "${{ steps.parse_commits.outputs.commits_csv }}"
+        
+        echo "=== 从指定提交提取文件列表（去重）==="
+        
+        # 使用关联数组存储文件（自动去重）
+        declare -A UNIQUE_FILES_MAP
+        declare -A FILE_SOURCES  # 记录文件来源提交
+        
+        COMMIT_INDEX=0
+        TOTAL_FILES=0
+        
+        for commit in "${COMMITS[@]}"; do
+          COMMIT_INDEX=$((COMMIT_INDEX + 1))
+          echo ""
+          echo "📝 处理提交 $COMMIT_INDEX/${#COMMITS[@]}: ${commit:0:8}"
+          
+          # 获取该提交的文件列表（只获取元数据，不下载文件内容）
+          COMMIT_FILES=$(git ls-tree -r --name-only $commit)
+          FILE_COUNT=$(echo "$COMMIT_FILES" | wc -l)
+          TOTAL_FILES=$((TOTAL_FILES + FILE_COUNT))
+          
+          echo "提交包含 $FILE_COUNT 个文件"
+          
+          # 添加到唯一文件映射
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              UNIQUE_FILES_MAP["$file"]=1
+              # 记录文件来源（使用最后一个包含该文件的提交）
+              FILE_SOURCES["$file"]=$commit
+            fi
+          done <<< "$COMMIT_FILES"
+          
+          # 显示提交信息
+          COMMIT_MSG=$(git show --no-patch --format="%s" $commit 2>/dev/null || echo "无法获取提交信息")
+          echo "提交信息: $COMMIT_MSG"
+        done
+        
+        # 转换为数组
+        UNIQUE_FILES=("${!UNIQUE_FILES_MAP[@]}")
+        UNIQUE_FILE_COUNT=${#UNIQUE_FILES[@]}
+        
+        echo ""
+        echo "📊 文件提取统计:"
+        echo "  处理提交数: ${#COMMITS[@]}"
+        echo "  总文件数（去重前）: $TOTAL_FILES"
+        echo "  唯一文件数（去重后）: $UNIQUE_FILE_COUNT"
+        echo "  去重率: $(( (TOTAL_FILES - UNIQUE_FILE_COUNT) * 100 / TOTAL_FILES ))%"
+        
+        # 保存文件列表和来源信息
+        printf "%s\n" "${UNIQUE_FILES[@]}" > /tmp/unique_files.txt
+        
+        # 保存文件来源映射
+        for file in "${UNIQUE_FILES[@]}"; do
+          echo "$file|${FILE_SOURCES[$file]}" >> /tmp/file_sources.txt
+        done
+        
+        echo "file_count=$UNIQUE_FILE_COUNT" >> $GITHUB_OUTPUT
+        
+        # 显示文件列表预览
+        echo ""
+        echo "📁 唯一文件列表预览:"
+        printf "%s\n" "${UNIQUE_FILES[@]}" | head -10
+        if [ $UNIQUE_FILE_COUNT -gt 10 ]; then
+          echo "... 还有 $((UNIQUE_FILE_COUNT - 10)) 个文件"
+        fi
+        
+    - name: 检出目标仓库（准备同步）
+      run: |
+        echo "=== 检出目标仓库 ==="
+        cd /tmp/sync_workspace
+        
+        # 添加目标仓库远程
+        git remote add target https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.target_repo }}.git
+        
+        # 检出目标仓库
+        git fetch target --depth=1
+        git checkout -b sync-branch target/${{ steps.parse_urls.outputs.target_branch }} || git checkout -b sync-branch
+        
+        echo "✅ 目标仓库检出完成"
+        
+    - name: 按文件名从源仓库获取文件内容
+      run: |
+        echo "=== 从源仓库获取指定文件内容 ==="
+        cd /tmp/sync_workspace
+        
+        # 读取文件列表
+        mapfile -t UNIQUE_FILES < /tmp/unique_files.txt
+        echo "需要获取的文件数量: ${#UNIQUE_FILES[@]}"
+        
+        # 读取文件来源映射
+        declare -A FILE_SOURCES
+        while IFS='|' read -r file commit; do
+          FILE_SOURCES["$file"]=$commit
+        done < /tmp/file_sources.txt
+        
+        SUCCESS_COUNT=0
+        FAIL_COUNT=0
+        
+        # 逐个文件从源仓库获取
+        for file in "${UNIQUE_FILES[@]}"; do
+          SOURCE_COMMIT="${FILE_SOURCES[$file]}"
+          if [ -n "$SOURCE_COMMIT" ]; then
+            # 确保目录存在
+            mkdir -p "$(dirname "$file")"
+            
+            # 从源仓库的特定提交获取文件
+            if git show "$SOURCE_COMMIT:$file" > "$file" 2>/dev/null; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              echo "✅ [$SUCCESS_COUNT] 获取: $file (来自 ${SOURCE_COMMIT:0:8})"
+            else
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              echo "❌ 获取失败: $file"
+            fi
+          else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo "❌ 找不到文件来源: $file"
+          fi
+        done
+        
+        echo "文件获取完成: 成功 $SUCCESS_COUNT, 失败 $FAIL_COUNT"
         
     - name: 删除目标仓库多余文件
       run: |
-        SOURCE_FILES=$(cat /tmp/source_files.txt)
+        echo "=== 清理目标仓库多余文件 ==="
+        cd /tmp/sync_workspace
+        
+        # 读取需要保留的文件列表
+        mapfile -t UNIQUE_FILES < /tmp/unique_files.txt
+        
+        # 获取目标仓库当前文件
         TARGET_FILES=$(git ls-files)
         
-        echo "=== 删除目标仓库中多余的文件 ==="
-        
         DELETE_COUNT=0
+        ERROR_COUNT=0
+        
         for file in $TARGET_FILES; do
-          if ! echo "$SOURCE_FILES" | grep -q "^$file$"; then
+          # 检查文件是否在需要保留的列表中
+          FILE_EXISTS=0
+          for keep_file in "${UNIQUE_FILES[@]}"; do
+            if [ "$file" = "$keep_file" ]; then
+              FILE_EXISTS=1
+              break
+            fi
+          done
+          
+          if [ $FILE_EXISTS -eq 0 ]; then
             if git rm --cached "$file" 2>/dev/null || rm -f "$file" 2>/dev/null; then
-              echo "🗑️ 删除: $file"
               DELETE_COUNT=$((DELETE_COUNT + 1))
+              echo "🗑️ 删除: $file"
             else
+              ERROR_COUNT=$((ERROR_COUNT + 1))
               echo "⚠️ 删除失败: $file"
             fi
           fi
         done
         
-        echo "删除了 $DELETE_COUNT 个多余文件"
+        echo "清理完成: 删除 $DELETE_COUNT 个文件, 失败 $ERROR_COUNT 个"
         
-    - name: 最终一致性验证
+    - name: 添加获取的文件到Git索引
       run: |
-        FULL_HASH="${{ steps.resolve_commit.outputs.full_hash }}"
-        SOURCE_FILES=$(cat /tmp/source_files.txt)
+        echo "=== 添加文件到Git索引 ==="
+        cd /tmp/sync_workspace
         
-        echo "=== 最终一致性验证 ==="
+        # 读取文件列表
+        mapfile -t UNIQUE_FILES < /tmp/unique_files.txt
         
-        # 验证文件数量
-        SOURCE_COUNT=$(cat /tmp/source_files.txt | wc -l)
-        CURRENT_COUNT=$(git ls-files | wc -l)
+        ADD_COUNT=0
+        for file in "${UNIQUE_FILES[@]}"; do
+          if [ -f "$file" ]; then
+            git add "$file"
+            ADD_COUNT=$((ADD_COUNT + 1))
+            echo "✅ 添加: $file"
+          else
+            echo "⚠️ 文件不存在，跳过: $file"
+          fi
+        done
         
-        echo "源提交文件数: $SOURCE_COUNT"
-        echo "当前文件数: $CURRENT_COUNT"
-        
-        if [ "$SOURCE_COUNT" -eq "$CURRENT_COUNT" ]; then
-          echo "✅ 文件数量一致"
-        else
-          echo "⚠️ 文件数量不一致"
-        fi
-        
-        # 显示更改状态
-        echo "当前更改状态:"
-        git status --short
+        echo "添加完成: $ADD_COUNT 个文件"
         
     - name: 提交同步更改
       run: |
         echo "=== 提交文件同步 ==="
+        cd /tmp/sync_workspace
         
-        # 添加所有更改
-        git add -A
-        
-        # 检查是否有需要提交的更改
-        if git diff --cached --quiet; then
-          echo "📝 没有检测到文件更改（文件已完全一致）"
+        # 检查是否有更改需要提交
+        if git diff --cached --quiet && git diff --quiet; then
+          echo "📝 没有检测到文件更改"
         else
-          git commit -m "${{ github.event.inputs.commit_message }} (同步自提交 ${{ steps.resolve_commit.outputs.full_hash }})"
+          # 添加所有更改
+          git add -A
+          
+          # 使用用户提供的提交信息
+          git commit -m "${{ github.event.inputs.commit_message }}"
           echo "✅ 同步提交完成"
-          echo "提交哈希: $(git rev-parse HEAD)"
         fi
         
     - name: 推送到目标仓库
       run: |
         echo "=== 推送到目标仓库 ==="
+        cd /tmp/sync_workspace
         
-        # 检查是否有需要推送的提交
-        if git log @{u}..HEAD --oneline | grep -q .; then
-          echo "开始推送..."
-          git push origin ${{ steps.parse_urls.outputs.target_branch }}
+        if git log target/${{ steps.parse_urls.outputs.target_branch }}..HEAD --oneline | grep -q .; then
+          echo "推送到目标仓库..."
+          git push target sync-branch:${{ steps.parse_urls.outputs.target_branch }}
           echo "✅ 推送完成"
         else
-          echo "📝 没有需要推送的更改（工作目录已与源提交一致）"
+          echo "📝 没有需要推送的更改"
         fi
         
     - name: 创建同步标签
       run: |
+        cd /tmp/sync_workspace
         TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-        SHORT_HASH=$(echo ${{ steps.resolve_commit.outputs.full_hash }} | cut -c1-8)
-        TAG_NAME="sync-$TIMESTAMP-$SHORT_HASH"
-        
-        git tag -a "$TAG_NAME" -m "文件同步自提交 ${{ steps.resolve_commit.outputs.full_hash }} - ${{ github.event.inputs.commit_message }}"
-        git push origin "$TAG_NAME"
+        TAG_NAME="sync-${TIMESTAMP}"
+        git tag -a "$TAG_NAME" -m "同步自 ${{ steps.parse_commits.outputs.commits_count }} 个提交 - ${{ github.event.inputs.commit_message }}"
+        git push target "$TAG_NAME"
         echo "✅ 同步标签已创建: $TAG_NAME"
         
     - name: 清理工作区
       run: |
-        rm -f /tmp/source_files.txt
-        git remote remove source
-        echo "✅ 工作区清理完成"
+        rm -f /tmp/unique_files.txt
+        rm -f /tmp/file_sources.txt
+        rm -rf /tmp/sync_workspace
         
     - name: 显示同步摘要
       run: |
@@ -258,16 +392,15 @@ jobs:
         echo ""
         echo "📊 同步摘要:"
         echo "  📦 源仓库: ${{ steps.parse_urls.outputs.source_repo }}"
-        echo "  🔗 源提交: ${{ steps.resolve_commit.outputs.full_hash }}"
+        echo "  🔗 处理提交数: ${{ steps.parse_commits.outputs.commits_count }}"
+        echo "  📁 同步文件数: ${{ steps.extract_files.outputs.file_count }}"
         echo "  🎯 目标仓库: ${{ steps.parse_urls.outputs.target_repo }}"
         echo "  🌿 目标分支: ${{ steps.parse_urls.outputs.target_branch }}"
-        echo "  📁 同步文件数: ${{ steps.extract_files.outputs.file_count }}"
-        echo "  👤 提交者: ${{ steps.set_commit_name.outputs.commit_name }}"
+        echo "  👤 提交作者: ${{ steps.set_commit_info.outputs.author_name }}"
         echo "  💬 提交信息: ${{ github.event.inputs.commit_message }}"
         echo ""
         echo "⚡ 同步策略:"
-        echo "  ✅ 无条件文件覆盖（无论是否相同）"
-        echo "  ✅ 保留目标仓库完整历史"
+        echo "  ✅ 临时工作目录处理"
+        echo "  ✅ 先分析源仓库文件"
+        echo "  ✅ 后检出目标仓库"
         echo "  ✅ 精确文件级同步"
-        echo ""
-        echo "✅ 目标仓库文件状态现在与源提交完全一致"
