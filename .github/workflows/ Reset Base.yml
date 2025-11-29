@@ -1,4 +1,4 @@
-name: Source Commit Sync - Reset Base
+name: Source Commit Sync - Preserve History
 
 on:
   workflow_dispatch:
@@ -18,21 +18,21 @@ on:
       target_branch:
         description: '目标分支名'
         required: true
-        default: 'MIUI'
+        default: 'main'
       commit_hashes:
         description: '要同步的提交哈希'
         required: true
         default: '32ac13d'
       new_branch_name:
-        description: '新分支名'
-        required: false
-        default: 'susfs-sync'
+        description: '新分支名（必需）'
+        required: true
+        default: 'sync-source-commits'
 
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  sync-reset-base:
+  preserve-history-sync:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout target repository
@@ -53,27 +53,19 @@ jobs:
         git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
         git fetch source ${{ github.event.inputs.source_branch }}
 
-    - name: Create clean branch from source base
+    - name: Create new branch from target
       id: create_branch
       run: |
-        # 获取源提交的父提交作为起点
-        COMMITS=($(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' '))
-        FIRST_COMMIT=${COMMITS[0]}
-        PARENT_COMMIT=$(git log --pretty=%P -n 1 "$FIRST_COMMIT")
-        
-        echo "源提交: $FIRST_COMMIT"
-        echo "父提交: $PARENT_COMMIT"
-        
-        # 基于父提交创建新分支
-        git checkout -b "${{ github.event.inputs.new_branch_name }}" "$PARENT_COMMIT"
-        echo "parent_commit=$PARENT_COMMIT" >> $GITHUB_OUTPUT
+        # 基于目标分支创建新分支
+        git checkout -b "${{ github.event.inputs.new_branch_name }}"
+        echo "✅ 创建新分支: ${{ github.event.inputs.new_branch_name }}"
+        echo "✅ 目标分支 ${{ github.event.inputs.target_branch }} 历史保持不变"
 
-    - name: Apply commits with exact file copy
+    - name: Apply commits to new branch
       id: apply_commits
       run: |
-        echo "应用提交（精确文件复制）..."
+        echo "应用提交到新分支..."
         COMMITS=$(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' ')
-        APPLIED_COUNT=0
         
         for COMMIT in $COMMITS; do
           echo "处理提交: $COMMIT"
@@ -83,56 +75,59 @@ jobs:
           ORIG_DATE=$(git log -1 --format="%ci" "$COMMIT")
           CLEAN_MSG=$(echo "$ORIG_MSG" | grep -v -E "(Co-authored-by|Reviewed-by|Signed-off-by):")
           
-          # 获取提交中的所有文件
-          FILES=$(git ls-tree -r --name-only "$COMMIT")
-          echo "提交实际包含文件: $(echo "$FILES" | wc -l) 个"
-          echo "文件列表:"
-          echo "$FILES"
+          # 获取修改的文件
+          MODIFIED_FILES=$(git show --name-only --format= "$COMMIT" | grep -v '^$')
+          echo "修改文件: $(echo "$MODIFIED_FILES" | wc -l) 个"
           
-          # 强制复制所有源文件
-          for file in $FILES; do
-            echo "复制文件: $file"
+          # 复制文件
+          for file in $MODIFIED_FILES; do
             mkdir -p "$(dirname "$file")"
-            git show "$COMMIT":"$file" > "$file" 2>/dev/null || echo "⚠️ 文件不存在: $file"
+            git show "$COMMIT":"$file" > "$file" 2>/dev/null || true
           done
           
-          # 处理删除的文件
-          DELETED_FILES=$(git diff --name-only --diff-filter=D "$COMMIT"^.."$COMMIT" 2>/dev/null || true)
-          if [ -n "$DELETED_FILES" ]; then
-            echo "删除文件: $(echo "$DELETED_FILES" | wc -l) 个"
-            for dfile in $DELETED_FILES; do
-              rm -f "$dfile" 2>/dev/null || true
-            done
-          fi
-          
-          # 提交
+          # 提交到新分支
           git add -A
           git commit -m "$CLEAN_MSG" --author="mozi9 <mozi9>" --date="$ORIG_DATE"
-          
-          # 验证提交
-          COMMIT_STATS=$(git log -1 --stat)
-          echo "提交统计:"
-          echo "$COMMIT_STATS"
-          
-          APPLIED_COUNT=$((APPLIED_COUNT + 1))
-          echo "✅ 提交应用完成"
         done
         
-        echo "applied_count=$APPLIED_COUNT" >> $GITHUB_OUTPUT
+        echo "✅ 所有提交已应用到新分支"
 
-    - name: Push to new branch
+    - name: Push only new branch
+      id: push_branch
       run: |
+        # 只推送新分支，不修改目标分支
         git push -u origin "${{ github.event.inputs.new_branch_name }}"
-        echo "✅ 推送完成"
+        echo "✅ 新分支已推送"
+        echo "✅ 目标分支 ${{ github.event.inputs.target_branch }} 保持不变"
 
-    - name: Final verification
+    - name: Create pull request (可选)
+      id: create_pr
+      uses: actions/github-script@v6
+      with:
+        script: |
+          await github.rest.pulls.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: 'sync: 同步源提交',
+            head: '${{ github.event.inputs.new_branch_name }}',
+            base: '${{ github.event.inputs.target_branch }}',
+            body: '自动创建的同步请求\n\n源提交: ${{ github.event.inputs.commit_hashes }}'
+          });
+
+    - name: Final report
       run: |
         echo ""
-        echo "🎉 精确同步完成!"
+        echo "🎉 同步完成!"
         echo "=========================================="
-        echo "📊 文件验证:"
-        echo "  源提交文件数: 13 个"
-        echo "  实际提交文件数: $(git ls-tree -r --name-only HEAD | wc -l) 个"
-        echo "  提交统计:"
-        git log -1 --stat
+        echo "✅ 历史保护:"
+        echo "  目标分支: ${{ github.event.inputs.target_branch }} - 未修改"
+        echo "  创建新分支: ${{ github.event.inputs.new_branch_name }}"
+        echo "  提交数量: $(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' ' | wc -w) 个"
+        echo ""
+        echo "🔗 下一步操作:"
+        echo "  1. 审查新分支的更改"
+        echo "  2. 手动合并到目标分支（如需）"
+        echo "  3. 或等待PR审查"
+        echo ""
+        echo "⚠️ 重要: 目标仓库历史保持不变"
         echo "=========================================="
