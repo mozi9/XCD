@@ -257,15 +257,32 @@ jobs:
           echo "✅ 文件复制提交完成"
         fi
 
+    - name: Get sync branch name
+      id: get_branch_name
+      run: |
+        echo "获取同步分支名称..."
+        SYNC_BRANCH=$(git branch --show-current)
+        echo "当前分支: $SYNC_BRANCH"
+        echo "sync_branch_name=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
     - name: Merge to target branch
       id: merge_branch
       run: |
         echo "合并到目标分支..."
         git checkout ${{ github.event.inputs.target_branch }}
         
-        # 修正：git merge 不支持 --author 参数
-        # 先合并，然后修改作者信息
-        git merge --no-ff -m "merge: 同步提交" sync-*
+        # 使用保存的分支名称
+        SYNC_BRANCH="${{ steps.get_branch_name.outputs.sync_branch_name }}"
+        
+        if [ -z "$SYNC_BRANCH" ]; then
+          echo "❌ 错误: 未找到同步分支名称"
+          exit 1
+        fi
+        
+        echo "合并分支: $SYNC_BRANCH"
+        
+        # 执行合并
+        git merge --no-ff -m "merge: 同步提交" "$SYNC_BRANCH"
         
         # 修改合并提交的作者信息
         git commit --amend --author="mozi9 <mozi9>" --no-edit
@@ -321,7 +338,10 @@ jobs:
     - name: Cleanup
       run: |
         echo "清理临时分支..."
-        git branch -D sync-* 2>/dev/null || true
+        SYNC_BRANCH="${{ steps.get_branch_name.outputs.sync_branch_name }}"
+        if [ -n "$SYNC_BRANCH" ]; then
+          git branch -D "$SYNC_BRANCH" 2>/dev/null || true
+        fi
         echo "✅ 清理完成"
 
     - name: Generate final report
