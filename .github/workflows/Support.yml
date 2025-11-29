@@ -1,0 +1,104 @@
+name: Source Commit Sync with Branch Support
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库地址'
+        required: true
+        default: 'owner/source-repo'
+      source_branch:
+        description: '源分支名'
+        required: true
+        default: 'main'
+      target_repo:
+        description: '目标仓库地址'
+        required: true
+        default: 'owner/target-repo'
+      target_branch:
+        description: '目标分支名'
+        required: true
+        default: 'main'
+      commit_hashes:
+        description: '要同步的提交哈希'
+        required: true
+        default: ''
+      new_branch_name:
+        description: '新分支名（留空推送到目标分支）'
+        required: false
+        default: ''
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  branch-sync:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ secrets.Mozi9_PAT }}
+        ref: ${{ github.event.inputs.target_branch }}
+        fetch-depth: 0
+
+    - name: Setup Git identity
+      run: |
+        git config user.name "mozi9"
+        git config user.email "mozi9"
+
+    - name: Add source repository
+      run: |
+        echo "添加源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "源分支: ${{ github.event.inputs.source_branch }}"
+        git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source ${{ github.event.inputs.source_branch }}
+
+    - name: Determine target branch
+      id: set_branch
+      run: |
+        if [ -z "${{ github.event.inputs.new_branch_name }}" ]; then
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          echo "使用目标分支: $TARGET_BRANCH"
+        else
+          TARGET_BRANCH="${{ github.event.inputs.new_branch_name }}"
+          echo "创建新分支: $TARGET_BRANCH"
+          git checkout -b "$TARGET_BRANCH"
+        fi
+        echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Apply source commits
+      run: |
+        echo "应用源提交..."
+        echo "源分支: ${{ github.event.inputs.source_branch }}"
+        echo "目标分支: ${{ steps.set_branch.outputs.target_branch }}"
+        
+        COMMITS=$(echo '${{ github.event.inputs.commit_hashes }}' | tr ',' ' ')
+        for COMMIT in $COMMITS; do
+          echo "应用提交: $COMMIT"
+          git cherry-pick $COMMIT
+          git commit --amend --author="mozi9 <mozi9>" --no-edit
+        done
+
+    - name: Push to target branch
+      run: |
+        TARGET_BRANCH="${{ steps.set_branch.outputs.target_branch }}"
+        echo "推送到分支: $TARGET_BRANCH"
+        git push origin "$TARGET_BRANCH"
+
+    - name: Generate report
+      run: |
+        echo ""
+        echo "🎉 提交同步完成!"
+        echo "=========================================="
+        echo "📊 分支信息:"
+        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "  源分支: ${{ github.event.inputs.source_branch }}"
+        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "  目标分支: ${{ steps.set_branch.outputs.target_branch }}"
+        echo ""
+        echo "✅ 提交处理:"
+        echo "  作者统一为: mozi9 <mozi9>"
+        echo "  内容保持与源提交一致"
+        echo "=========================================="
