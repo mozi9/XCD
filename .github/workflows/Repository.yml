@@ -4,154 +4,139 @@ on:
   workflow_dispatch:
     inputs:
       source_repo:
-        description: '源仓库地址 (格式: owner/repo)'
+        description: 'Source repository (format: owner/repo)'
         required: true
-        type: string
         default: 'mozi9/source-repo'
-      source_branch:
-        description: '源仓库分支'
-        required: true
         type: string
+      source_branch:
+        description: 'Source repository branch'
+        required: true
         default: 'main'
+        type: string
       source_commits:
-        description: '源提交哈希 (多个用逗号分隔，如: abc123,def456)'
+        description: 'Source commit hashes (comma separated, e.g.: abc123,def456)'
         required: true
         type: string
       target_repo:
-        description: '目标仓库地址 (格式: owner/repo)'
+        description: 'Target repository (format: owner/repo)'
         required: true
         type: string
       target_branch:
-        description: '目标仓库分支'
+        description: 'Target repository branch'
         required: true
-        type: string
         default: 'main'
+        type: string
       new_author_name:
-        description: '新作者名称'
+        description: 'New author name'
         required: true
-        type: string
         default: 'mozi9'
+        type: string
       new_author_email:
-        description: '新作者邮箱'
+        description: 'New author email'
         required: true
-        type: string
         default: 'mozi9@example.com'
-      commit_message:
-        description: '提交信息'
-        required: true
         type: string
+      commit_message:
+        description: 'Commit message'
+        required: true
         default: 'Sync commit from source repository'
+        type: string
 
 jobs:
   sync-repository:
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout current repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         
-      - name: Setup Git
+      - name: Setup git config
         run: |
-          git config --global user.name "GitHub Actions"
-          git config --global user.email "actions@github.com"
-          
+          git config --global user.name "mozi9"
+          git config --global user.email "mozi9@example.com"
+      
       - name: Parse commit hashes
         id: parse_commits
         run: |
-          INPUT_COMMITS="${{ github.event.inputs.source_commits }}"
-          COUNT=0
-          IFS=',' read -ra COMMIT_ARRAY <<< "$INPUT_COMMITS"
+          CLEAN_INPUT=$(echo "${{ github.event.inputs.source_commits }}" | tr -d ' ')
+          IFS=',' read -ra COMMITS <<< "$CLEAN_INPUT"
+          echo "commit_count=${#COMMITS[@]}" >> $GITHUB_OUTPUT
           
-          for commit in "${COMMIT_ARRAY[@]}"; do
-            COMMIT_CLEAN=$(echo "$commit" | xargs)
-            if [ -n "$COMMIT_CLEAN" ]; then
-              echo "commit_$COUNT=$COMMIT_CLEAN" >> $GITHUB_OUTPUT
-              COUNT=$((COUNT + 1))
-            fi
+          for i in "${!COMMITS[@]}"; do
+            echo "commit_$i=${COMMITS[$i]}" >> $GITHUB_OUTPUT
           done
-          echo "commit_count=$COUNT" >> $GITHUB_OUTPUT
-          
+      
       - name: Setup target repository
         run: |
-          git clone https://${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git target-repo
+          git clone --quiet https://Mozi9_PAT@github.com/${{ github.event.inputs.target_repo }}.git target-repo
           cd target-repo
-          git checkout ${{ github.event.inputs.target_branch }} || git checkout -b ${{ github.event.inputs.target_branch }}
           
+          if git show-ref --verify --quiet refs/heads/${{ github.event.inputs.target_branch }}; then
+            git checkout --quiet ${{ github.event.inputs.target_branch }}
+          else
+            git checkout -b ${{ github.event.inputs.target_branch }}
+          fi
+      
       - name: Add source remote
         run: |
           cd target-repo
           git remote add source https://github.com/${{ github.event.inputs.source_repo }}.git
-          git fetch source ${{ github.event.inputs.source_branch }}
-          
-      - name: Sync single commit
-        if: ${{ steps.parse_commits.outputs.commit_count == '1' }}
+          git fetch --quiet source ${{ github.event.inputs.source_branch }}
+      
+      - name: Sync commits
         run: |
           cd target-repo
-          COMMIT_HASH=${{ steps.parse_commits.outputs.commit_0 }}
+          SUCCESS_COUNT=0
+          TOTAL_COUNT=${{ steps.parse_commits.outputs.commit_count }}
           
-          git cherry-pick "$COMMIT_HASH" --no-commit || {
-            git status --porcelain | while read -r line; do
-              if [ -n "$line" ]; then
-                STATUS="${line:0:2}"
-                FILE_PATH="${line:3}"
-                case "$STATUS" in
-                  "UU"|"AA"|"DD")
-                    [ -f "$FILE_PATH" ] && git checkout --ours "$FILE_PATH" && git add "$FILE_PATH"
-                    ;;
-                  " D")
-                    [ -f "$FILE_PATH" ] && git rm "$FILE_PATH"
-                    ;;
-                esac
-              fi
-            done
-          }
-          
-          git add -A
-          git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
-            --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
-            --allow-empty --keep-redundant-commits
-            
-      - name: Sync multiple commits
-        if: ${{ steps.parse_commits.outputs.commit_count > '1' }}
-        run: |
-          cd target-repo
-          TOTAL=${{ steps.parse_commits.outputs.commit_count }}
-          
-          for ((i=0; i<TOTAL; i++)); do
+          for ((i=0; i<TOTAL_COUNT; i++)); do
             COMMIT_HASH=${{ steps.parse_commits.outputs['commit_'$i] }}
             
-            git cherry-pick "$COMMIT_HASH" --no-commit || {
-              git status --porcelain | while read -r line; do
-                if [ -n "$line" ]; then
-                  STATUS="${line:0:2}"
-                  FILE_PATH="${line:3}"
-                  case "$STATUS" in
-                    "UU"|"AA"|"DD")
-                      [ -f "$FILE_PATH" ] && git checkout --ours "$FILE_PATH" && git add "$FILE_PATH"
-                      ;;
-                    " D")
-                      [ -f "$FILE_PATH" ] && git rm "$FILE_PATH"
-                      ;;
-                  esac
-                fi
+            if git cherry-pick $COMMIT_HASH --no-commit 2>/dev/null; then
+              HAS_CHANGES=true
+            else
+              HAS_CHANGES=false
+              
+              git status --porcelain | grep "^UU\|^AA\|^DD" | cut -c4- | while read file; do
+                [ -f "$file" ] && git checkout --ours "$file" && git add "$file"
               done
-            }
+              
+              git status --porcelain | grep "^ D" | cut -c3- | while read file; do
+                [ -f "$file" ] && git rm "$file" && HAS_CHANGES=true
+              done
+              
+              git status --porcelain | grep "^R" | while read line; do
+                OLD=$(echo "$line" | awk '{print $2}')
+                NEW=$(echo "$line" | awk '{print $3}')
+                [ -f "$OLD" ] && git mv "$OLD" "$NEW" && HAS_CHANGES=true
+              done
+            fi
             
             git add -A
-            git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
-              --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
-              --allow-empty --keep-redundant-commits
+            
+            if [ "$HAS_CHANGES" = "true" ] || git diff --cached --quiet; then
+              git commit -m "${{ github.event.inputs.commit_message }} [$COMMIT_HASH]" \
+                --author="${{ github.event.inputs.new_author_name }} <${{ github.event.inputs.new_author_email }}>" \
+                --allow-empty \
+                --keep-redundant-commits
+              ((SUCCESS_COUNT++))
+            fi
           done
-          
+      
       - name: Push changes
         run: |
           cd target-repo
           git push origin ${{ github.event.inputs.target_branch }}
-          
+      
       - name: Cleanup
         if: always()
-        run: rm -rf target-repo
-        
+        run: |
+          rm -rf target-repo
+      
       - name: Summary
         run: |
-          echo "Sync completed: ${{ steps.parse_commits.outputs.commit_count }} commits"
+          echo "Sync completed"
+          echo "Source: ${{ github.event.inputs.source_repo }}"
+          echo "Target: ${{ github.event.inputs.target_repo }}"
+          echo "Commits: ${{ steps.parse_commits.outputs.commit_count }}"
           echo "Author: ${{ github.event.inputs.new_author_name }}"
