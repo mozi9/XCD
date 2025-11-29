@@ -1,0 +1,102 @@
+name: Sync Repository with Override
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库地址 (格式: owner/repo 或完整URL)'
+        required: true
+        default: 'owner/source-repo'
+      source_commit:
+        description: '源提交 (分支名、标签、短哈希或完整哈希)'
+        required: true
+        default: 'main'
+      target_repo:
+        description: '目标仓库地址 (格式: owner/repo 或完整URL)'
+        required: true
+        default: 'owner/target-repo'
+      commit_name:
+        description: '提交显示名称'
+        required: true
+        default: 'mozi9'
+      commit_message:
+        description: '提交信息'
+        required: true
+        default: 'Sync from source repository'
+      use_full_hash:
+        description: '是否使用完整哈希 (true/false)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+        - 'true'
+        - 'false'
+
+env:
+  PAT: ${{ secrets.MOZI9_PAT }}
+  GIT_USER: 'mozi9'
+  GIT_EMAIL: 'mozi9'
+
+jobs:
+  sync-repo:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ env.PAT }}
+        fetch-depth: 0
+        
+    - name: Configure Git
+      run: |
+        git config --global user.name "${{ env.GIT_USER }}"
+        git config --global user.email "${{ env.GIT_EMAIL }}"
+        git config --global push.default simple
+        
+    - name: Add source repository as remote
+      run: |
+        git remote add source https://${{ env.PAT }}@github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source --depth=1
+        
+    - name: Get full commit hash from source
+      id: get_hash
+      run: |
+        if [ "${{ github.event.inputs.use_full_hash }}" = "true" ]; then
+          FULL_HASH="${{ github.event.inputs.source_commit }}"
+        else
+          FULL_HASH=$(git rev-parse source/${{ github.event.inputs.source_commit }})
+        fi
+        echo "full_hash=$FULL_HASH" >> $GITHUB_OUTPUT
+        echo "Resolved commit hash: $FULL_HASH"
+        
+    - name: Checkout source commit
+      run: |
+        git checkout ${{ steps.get_hash.outputs.full_hash }}
+        
+    - name: Reset target branch to source commit (override all changes)
+      run: |
+        git reset --hard ${{ steps.get_hash.outputs.full_hash }}
+        
+    - name: Rewrite commit author information
+      run: |
+        git filter-branch -f --env-filter "
+          export GIT_COMMITTER_NAME='${{ env.GIT_USER }}'
+          export GIT_COMMITTER_EMAIL='${{ env.GIT_EMAIL }}'
+          export GIT_AUTHOR_NAME='${{ env.GIT_USER }}'
+          export GIT_AUTHOR_EMAIL='${{ env.GIT_EMAIL }}'
+        " HEAD
+        
+    - name: Force push to target repository
+      run: |
+        git push --force origin HEAD:main
+        
+    - name: Create annotated tag for the sync operation
+      run: |
+        git tag -a "sync-${{ steps.get_hash.outputs.full_hash }}" -m "${{ github.event.inputs.commit_message }}"
+        git push origin "sync-${{ steps.get_hash.outputs.full_hash }}"
+        
+    - name: Cleanup
+      run: |
+        git remote remove source
