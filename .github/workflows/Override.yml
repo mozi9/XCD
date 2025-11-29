@@ -102,11 +102,31 @@ jobs:
         git init
         git config user.name "${{ steps.set_commit_info.outputs.author_name }}"
         git config user.email "${{ steps.set_commit_info.outputs.author_email }}"
+        echo "✅ 临时工作目录已创建"
         
     - name: 添加源仓库远程
       run: |
         cd /tmp/sync_workspace
         git remote add source https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.source_repo }}.git
+        echo "✅ 源仓库远程已添加: ${{ steps.parse_urls.outputs.source_repo }}"
+        
+    - name: 获取源仓库数据
+      run: |
+        cd /tmp/sync_workspace
+        echo "开始获取源仓库数据..."
+        
+        # 先获取源仓库的引用信息
+        git fetch source --depth=1
+        
+        # 尝试获取更多历史以包含可能的提交
+        COMMITS_INPUT="${{ github.event.inputs.source_commits }}"
+        CLEANED_COMMITS=$(echo "$COMMITS_INPUT" | tr -d '[:space:]')
+        IFS=',' read -ra COMMIT_ARRAY <<< "$CLEANED_COMMITS"
+        
+        # 获取包含这些提交的分支或标签
+        git fetch source --depth=50
+        
+        echo "✅ 源仓库数据获取完成"
         
     - name: 解析和验证提交列表
       id: parse_commits
@@ -127,36 +147,77 @@ jobs:
         
         # 验证每个提交并获取完整哈希
         VALID_COMMITS=()
+        INVALID_COMMITS=()
         
         for commit in "${COMMIT_ARRAY[@]}"; do
           if [ -n "$commit" ]; then
-            # 获取提交元数据（不下载文件内容）
+            # 尝试多种方式解析提交
+            FULL_HASH=""
+            
+            # 方法1: 直接验证提交
+            if git cat-file -e $commit 2>/dev/null; then
+              FULL_HASH=$(git rev-parse $commit)
+              if [ "$(git cat-file -t $FULL_HASH)" = "commit" ]; then
+                VALID_COMMITS+=("$FULL_HASH")
+                echo "✅ 验证提交: $commit -> $FULL_HASH"
+                continue
+              fi
+            fi
+            
+            # 方法2: 尝试获取提交
+            echo "尝试获取提交: $commit"
             if git fetch source --depth=1 $commit 2>/dev/null; then
               if git cat-file -e $commit 2>/dev/null; then
                 FULL_HASH=$(git rev-parse $commit)
                 if [ "$(git cat-file -t $FULL_HASH)" = "commit" ]; then
                   VALID_COMMITS+=("$FULL_HASH")
                   echo "✅ 获取并验证提交: $commit -> $FULL_HASH"
-                else
-                  echo "❌ 无效提交对象: $commit"
+                  continue
                 fi
-              else
-                echo "❌ 提交不存在: $commit"
               fi
-            else
-              echo "❌ 无法获取提交: $commit"
             fi
+            
+            # 方法3: 尝试从引用中查找
+            echo "尝试从引用中查找提交: $commit"
+            if git ls-remote source | grep -q "$commit"; then
+              # 提交存在但需要获取
+              if git fetch source --depth=1 $commit 2>/dev/null; then
+                if git cat-file -e $commit 2>/dev/null; then
+                  FULL_HASH=$(git rev-parse $commit)
+                  VALID_COMMITS+=("$FULL_HASH")
+                  echo "✅ 从远程获取提交: $commit -> $FULL_HASH"
+                  continue
+                fi
+              fi
+            fi
+            
+            # 所有方法都失败
+            INVALID_COMMITS+=("$commit")
+            echo "❌ 无法获取提交: $commit"
           fi
         done
         
         if [ ${#VALID_COMMITS[@]} -eq 0 ]; then
           echo "❌ 错误：没有找到有效的提交"
+          echo "无效的提交: ${INVALID_COMMITS[*]}"
+          echo "调试信息:"
+          echo "源仓库: ${{ steps.parse_urls.outputs.source_repo }}"
+          echo "远程引用列表:"
+          git ls-remote source | head -10
           exit 1
+        fi
+        
+        if [ ${#INVALID_COMMITS[@]} -gt 0 ]; then
+          echo "⚠️ 警告：以下提交无效，将被忽略: ${INVALID_COMMITS[*]}"
         fi
         
         COMMITS_CSV=$(IFS=','; echo "${VALID_COMMITS[*]}")
         echo "commits_csv=$COMMITS_CSV" >> $GITHUB_OUTPUT
         echo "commits_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
+        echo "valid_commits=${VALID_COMMITS[*]}" >> $GITHUB_OUTPUT
+        
+        echo "✅ 有效提交列表: $COMMITS_CSV"
+        echo "📊 有效提交数量: ${#VALID_COMMITS[@]}"
         
     - name: 从指定提交中提取文件列表（去重）
       id: extract_files
@@ -178,7 +239,7 @@ jobs:
           echo ""
           echo "📝 处理提交 $COMMIT_INDEX/${#COMMITS[@]}: ${commit:0:8}"
           
-          # 获取该提交的文件列表（只获取元数据，不下载文件内容）
+          # 获取该提交的文件列表
           COMMIT_FILES=$(git ls-tree -r --name-only $commit)
           FILE_COUNT=$(echo "$COMMIT_FILES" | wc -l)
           TOTAL_FILES=$((TOTAL_FILES + FILE_COUNT))
@@ -208,7 +269,6 @@ jobs:
         echo "  处理提交数: ${#COMMITS[@]}"
         echo "  总文件数（去重前）: $TOTAL_FILES"
         echo "  唯一文件数（去重后）: $UNIQUE_FILE_COUNT"
-        echo "  去重率: $(( (TOTAL_FILES - UNIQUE_FILE_COUNT) * 100 / TOTAL_FILES ))%"
         
         # 保存文件列表和来源信息
         printf "%s\n" "${UNIQUE_FILES[@]}" > /tmp/unique_files.txt
@@ -228,24 +288,33 @@ jobs:
           echo "... 还有 $((UNIQUE_FILE_COUNT - 10)) 个文件"
         fi
         
-    - name: 检出目标仓库（准备同步）
+    - name: 添加目标仓库远程
       run: |
-        echo "=== 检出目标仓库 ==="
         cd /tmp/sync_workspace
-        
-        # 添加目标仓库远程
         git remote add target https://${{ env.PAT }}@github.com/${{ steps.parse_urls.outputs.target_repo }}.git
+        echo "✅ 目标仓库远程已添加: ${{ steps.parse_urls.outputs.target_repo }}"
         
-        # 检出目标仓库
+    - name: 检出目标仓库
+      run: |
+        cd /tmp/sync_workspace
+        echo "=== 检出目标仓库 ==="
+        
+        # 获取目标仓库数据
         git fetch target --depth=1
-        git checkout -b sync-branch target/${{ steps.parse_urls.outputs.target_branch }} || git checkout -b sync-branch
         
-        echo "✅ 目标仓库检出完成"
+        # 检出目标分支
+        if git show-ref --verify --quiet refs/remotes/target/${{ steps.parse_urls.outputs.target_branch }}; then
+          git checkout -b sync-branch target/${{ steps.parse_urls.outputs.target_branch }}
+          echo "✅ 检出目标分支: ${{ steps.parse_urls.outputs.target_branch }}"
+        else
+          echo "❌ 目标分支不存在，创建新分支"
+          git checkout -b sync-branch
+        fi
         
     - name: 按文件名从源仓库获取文件内容
       run: |
-        echo "=== 从源仓库获取指定文件内容 ==="
         cd /tmp/sync_workspace
+        echo "=== 从源仓库获取指定文件内容 ==="
         
         # 读取文件列表
         mapfile -t UNIQUE_FILES < /tmp/unique_files.txt
@@ -285,8 +354,8 @@ jobs:
         
     - name: 删除目标仓库多余文件
       run: |
-        echo "=== 清理目标仓库多余文件 ==="
         cd /tmp/sync_workspace
+        echo "=== 清理目标仓库多余文件 ==="
         
         # 读取需要保留的文件列表
         mapfile -t UNIQUE_FILES < /tmp/unique_files.txt
@@ -320,48 +389,26 @@ jobs:
         
         echo "清理完成: 删除 $DELETE_COUNT 个文件, 失败 $ERROR_COUNT 个"
         
-    - name: 添加获取的文件到Git索引
-      run: |
-        echo "=== 添加文件到Git索引 ==="
-        cd /tmp/sync_workspace
-        
-        # 读取文件列表
-        mapfile -t UNIQUE_FILES < /tmp/unique_files.txt
-        
-        ADD_COUNT=0
-        for file in "${UNIQUE_FILES[@]}"; do
-          if [ -f "$file" ]; then
-            git add "$file"
-            ADD_COUNT=$((ADD_COUNT + 1))
-            echo "✅ 添加: $file"
-          else
-            echo "⚠️ 文件不存在，跳过: $file"
-          fi
-        done
-        
-        echo "添加完成: $ADD_COUNT 个文件"
-        
     - name: 提交同步更改
       run: |
-        echo "=== 提交文件同步 ==="
         cd /tmp/sync_workspace
+        echo "=== 提交文件同步 ==="
+        
+        # 添加所有更改
+        git add -A
         
         # 检查是否有更改需要提交
         if git diff --cached --quiet && git diff --quiet; then
           echo "📝 没有检测到文件更改"
         else
-          # 添加所有更改
-          git add -A
-          
-          # 使用用户提供的提交信息
           git commit -m "${{ github.event.inputs.commit_message }}"
           echo "✅ 同步提交完成"
         fi
         
     - name: 推送到目标仓库
       run: |
-        echo "=== 推送到目标仓库 ==="
         cd /tmp/sync_workspace
+        echo "=== 推送到目标仓库 ==="
         
         if git log target/${{ steps.parse_urls.outputs.target_branch }}..HEAD --oneline | grep -q .; then
           echo "推送到目标仓库..."
@@ -398,9 +445,3 @@ jobs:
         echo "  🌿 目标分支: ${{ steps.parse_urls.outputs.target_branch }}"
         echo "  👤 提交作者: ${{ steps.set_commit_info.outputs.author_name }}"
         echo "  💬 提交信息: ${{ github.event.inputs.commit_message }}"
-        echo ""
-        echo "⚡ 同步策略:"
-        echo "  ✅ 临时工作目录处理"
-        echo "  ✅ 先分析源仓库文件"
-        echo "  ✅ 后检出目标仓库"
-        echo "  ✅ 精确文件级同步"
