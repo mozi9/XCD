@@ -120,9 +120,7 @@ jobs:
       run: |
         echo "收集源提交中标记为删除的文件..."
         
-        # 禁用错误退出
         set +e
-        
         COMMITS=$(cat /tmp/valid_commits.txt)
         DELETED_FILES=""
         
@@ -137,10 +135,8 @@ jobs:
           fi
         done
         
-        # 重新启用错误退出
         set -e
         
-        # 处理结果
         if [ -z "$DELETED_FILES" ]; then
           echo "ℹ️ 没有找到标记为删除的文件"
           touch /tmp/deleted_files.txt
@@ -167,9 +163,7 @@ jobs:
       run: |
         echo "提取源提交中的所有文件..."
         
-        # 禁用错误退出
         set +e
-        
         COMMITS=$(cat /tmp/valid_commits.txt)
         ALL_FILES=""
         
@@ -184,10 +178,8 @@ jobs:
           fi
         done
         
-        # 重新启用错误退出
         set -e
         
-        # 去重处理
         UNIQUE_FILES=$(echo "$ALL_FILES" | grep -v '^$' | sort | uniq)
         echo "$UNIQUE_FILES" > /tmp/all_source_files.txt
         FILE_COUNT=$(echo "$UNIQUE_FILES" | wc -l)
@@ -207,13 +199,11 @@ jobs:
         FAILED_COUNT=0
         
         for file in $ALL_FILES; do
-          # 跳过标记为删除的文件（后续单独处理）
           if echo "$DELETED_FILES" | grep -q "^$file$"; then
             echo "跳过删除文件: $file"
             continue
           fi
           
-          # 找到包含该文件的最后一个提交（获取最新版本）
           SOURCE_COMMIT=""
           for COMMIT in $COMMITS; do
             if git show "$COMMIT":"$file" >/dev/null 2>&1; then
@@ -223,10 +213,8 @@ jobs:
           
           if [ -n "$SOURCE_COMMIT" ]; then
             echo "复制: $file (来自 $SOURCE_COMMIT)"
-            # 创建目录（如果不存在）
             mkdir -p "$(dirname "$file")"
             
-            # 强制复制文件（无论内容是否相同）
             if git show "$SOURCE_COMMIT":"$file" > "$file" 2>/dev/null; then
               COPIED_COUNT=$((COPIED_COUNT + 1))
             else
@@ -248,10 +236,8 @@ jobs:
       run: |
         echo "提交复制的文件..."
         
-        # 添加所有文件到暂存区
         git add -A
         
-        # 检查是否有变更
         if git diff --cached --quiet; then
           echo "ℹ️ 没有检测到文件变更"
           echo "has_changes=false" >> $GITHUB_OUTPUT
@@ -259,7 +245,6 @@ jobs:
           echo "✅ 检测到文件变更，准备提交"
           echo "has_changes=true" >> $GITHUB_OUTPUT
           
-          # 准备提交信息
           COMMIT_NAME="${{ github.event.inputs.commit_name }}"
           COMMIT_DESC="${{ github.event.inputs.commit_description }}"
           
@@ -268,7 +253,6 @@ jobs:
             COMMIT_MSG="$COMMIT_MSG"$'\n\n'"$COMMIT_DESC"
           fi
           
-          # 创建提交
           git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
           echo "✅ 文件复制提交完成"
         fi
@@ -279,8 +263,12 @@ jobs:
         echo "合并到目标分支..."
         git checkout ${{ github.event.inputs.target_branch }}
         
-        # 使用非快进合并，保留合并历史
-        git merge --no-ff -m "merge: 同步提交" sync-* --author="mozi9 <mozi9>"
+        # 修正：git merge 不支持 --author 参数
+        # 先合并，然后修改作者信息
+        git merge --no-ff -m "merge: 同步提交" sync-*
+        
+        # 修改合并提交的作者信息
+        git commit --amend --author="mozi9 <mozi9>" --no-edit
         echo "✅ 合并完成"
 
     - name: Process deleted files
