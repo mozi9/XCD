@@ -1,4 +1,4 @@
-name: Manual Repository Sync - Smart Overwrite
+name: Manual Repository Sync - Force Overwrite
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ on:
         description: '合并提交描述（可选）'
         required: false
         default: ''
-      delete_commit_message:
+      delete_message:
         description: '删除文件提交信息'
         required: true
         default: 'delete: 删除标记文件'
@@ -59,6 +59,7 @@ jobs:
       run: |
         git config --global user.name "mozi9"
         git config --global user.email "mozi9"
+        git config --global push.default simple
         echo "Git identity set to: mozi9 <mozi9>"
 
     - name: Add source repository
@@ -86,15 +87,16 @@ jobs:
         COMMIT_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' ' ')
         
         VALID_COMMITS=()
+        INVALID_COMMITS=()
         
         for hash in $COMMIT_HASHES; do
-          FULL_HASH=$(git rev-parse --verify "$hash" 2>/dev/null || echo "")
-          if [ -n "$FULL_HASH" ]; then
-            COMMIT_SUBJECT=$(git log -1 --format="%s" "$FULL_HASH" 2>/dev/null || echo "无法获取提交信息")
-            echo "✅ 提交有效: $hash -> $FULL_HASH - $COMMIT_SUBJECT"
-            VALID_COMMITS+=("$FULL_HASH")
+          if git rev-parse --verify "$hash" >/dev/null 2>&1; then
+            COMMIT_SUBJECT=$(git log -1 --format="%s" "$hash" 2>/dev/null || echo "无法获取提交信息")
+            echo "✅ 提交有效: $hash - $COMMIT_SUBJECT"
+            VALID_COMMITS+=("$hash")
           else
             echo "❌ 提交无效: $hash"
+            INVALID_COMMITS+=("$hash")
           fi
         done
         
@@ -105,7 +107,7 @@ jobs:
         
         MAX_COMMITS=${{ github.event.inputs.max_commits }}
         if [ ${#VALID_COMMITS[@]} -gt $MAX_COMMITS ]; then
-          echo "⚠️ 提交数量 ${#VALID_COMMITS[@]} 超过最大限制 $MAX_COMMITS"
+          echo "⚠️ 警告: 提交数量 ${#VALID_COMMITS[@]} 超过最大限制 $MAX_COMMITS"
           VALID_COMMITS=("${VALID_COMMITS[@]:0:$MAX_COMMITS}")
         fi
         
@@ -114,23 +116,42 @@ jobs:
         echo "📊 将处理 ${#VALID_COMMITS[@]} 个有效提交"
 
     - name: Collect files marked for deletion
-      id: collect_deleted_files
+      id: collect_deleted
       run: |
         echo "收集源提交中标记为删除的文件..."
+        
+        # 禁用错误退出
+        set +e
+        
         COMMITS=$(cat /tmp/valid_commits.txt)
         DELETED_FILES=""
         
         for COMMIT in $COMMITS; do
-          DELETED_IN_COMMIT=$(git show "$COMMIT" --name-only --diff-filter=D --format= 2>/dev/null || true)
+          echo "分析提交: $COMMIT"
+          DELETED_IN_COMMIT=$(git show "$COMMIT" --name-only --diff-filter=D --format= 2>/dev/null)
+          
           if [ -n "$DELETED_IN_COMMIT" ]; then
+            DEL_COUNT_IN_COMMIT=$(echo "$DELETED_IN_COMMIT" | grep -c . || echo 0)
+            echo "  删除文件: $DEL_COUNT_IN_COMMIT 个"
             DELETED_FILES="$DELETED_FILES"$'\n'"$DELETED_IN_COMMIT"
           fi
         done
         
-        echo "$DELETED_FILES" | sort | uniq | grep -v '^$' > /tmp/deleted_files.txt
-        DEL_COUNT=$(cat /tmp/deleted_files.txt 2>/dev/null | wc -l || echo 0)
-        echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
-        echo "📊 收集到 $DEL_COUNT 个删除文件标记"
+        # 重新启用错误退出
+        set -e
+        
+        # 处理结果
+        if [ -z "$DELETED_FILES" ]; then
+          echo "ℹ️ 没有找到标记为删除的文件"
+          touch /tmp/deleted_files.txt
+          echo "deleted_files_count=0" >> $GITHUB_OUTPUT
+        else
+          CLEAN_DELETED=$(echo "$DELETED_FILES" | grep -v '^$' | sort | uniq)
+          echo "$CLEAN_DELETED" > /tmp/deleted_files.txt
+          DEL_COUNT=$(echo "$CLEAN_DELETED" | wc -l)
+          echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+          echo "📊 收集到 $DEL_COUNT 个删除文件标记"
+        fi
 
     - name: Create sync branch
       id: create_branch
@@ -139,28 +160,60 @@ jobs:
         SYNC_BRANCH="sync-$(date +%s)"
         git checkout -b "$SYNC_BRANCH"
         echo "branch_name=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+        echo "✅ 分支创建: $SYNC_BRANCH"
 
-    - name: Smart overwrite with source files
-      id: smart_overwrite
+    - name: Extract all files from source commits
+      id: extract_files
       run: |
-        echo "智能覆盖：相同文件也覆盖，不同文件用源文件..."
-        COMMITS=$(cat /tmp/valid_commits.txt)
+        echo "提取源提交中的所有文件..."
         
-        # 获取所有源提交中的文件
-        ALL_SOURCE_FILES=""
+        # 禁用错误退出
+        set +e
+        
+        COMMITS=$(cat /tmp/valid_commits.txt)
+        ALL_FILES=""
+        
         for COMMIT in $COMMITS; do
-          COMMIT_FILES=$(git show --name-only --format= "$COMMIT" 2>/dev/null | grep -v '^$' || true)
-          ALL_SOURCE_FILES="$ALL_SOURCE_FILES"$'\n'"$COMMIT_FILES"
+          echo "提取提交: $COMMIT 中的文件"
+          COMMIT_FILES=$(git show "$COMMIT" --name-only --format= 2>/dev/null | grep -v '^$')
+          
+          if [ -n "$COMMIT_FILES" ]; then
+            FILE_COUNT=$(echo "$COMMIT_FILES" | wc -l)
+            echo "  文件数量: $FILE_COUNT"
+            ALL_FILES="$ALL_FILES"$'\n'"$COMMIT_FILES"
+          fi
         done
         
-        # 去重得到源文件列表
-        SOURCE_FILES=$(echo "$ALL_SOURCE_FILES" | sort | uniq | grep -v '^$')
-        echo "$SOURCE_FILES" > /tmp/source_files.txt
+        # 重新启用错误退出
+        set -e
         
-        # 逐个文件从源提交复制（强制覆盖）
+        # 去重处理
+        UNIQUE_FILES=$(echo "$ALL_FILES" | grep -v '^$' | sort | uniq)
+        echo "$UNIQUE_FILES" > /tmp/all_source_files.txt
+        FILE_COUNT=$(echo "$UNIQUE_FILES" | wc -l)
+        echo "unique_file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+        echo "📊 提取到 $FILE_COUNT 个唯一文件"
+
+    - name: Force copy all files from source commits
+      id: copy_files
+      run: |
+        echo "强制复制源提交中的所有文件..."
+        
+        COMMITS=$(cat /tmp/valid_commits.txt)
+        ALL_FILES=$(cat /tmp/all_source_files.txt)
+        DELETED_FILES=$(cat /tmp/deleted_files.txt 2>/dev/null || true)
+        
         COPIED_COUNT=0
-        for file in $SOURCE_FILES; do
-          # 找到包含该文件的最后一个提交
+        FAILED_COUNT=0
+        
+        for file in $ALL_FILES; do
+          # 跳过标记为删除的文件（后续单独处理）
+          if echo "$DELETED_FILES" | grep -q "^$file$"; then
+            echo "跳过删除文件: $file"
+            continue
+          fi
+          
+          # 找到包含该文件的最后一个提交（获取最新版本）
           SOURCE_COMMIT=""
           for COMMIT in $COMMITS; do
             if git show "$COMMIT":"$file" >/dev/null 2>&1; then
@@ -169,59 +222,105 @@ jobs:
           done
           
           if [ -n "$SOURCE_COMMIT" ]; then
-            echo "覆盖文件: $file (来自提交 $SOURCE_COMMIT)"
+            echo "复制: $file (来自 $SOURCE_COMMIT)"
+            # 创建目录（如果不存在）
             mkdir -p "$(dirname "$file")"
-            git show "$SOURCE_COMMIT":"$file" > "$file" 2>/dev/null && COPIED_COUNT=$((COPIED_COUNT + 1))
+            
+            # 强制复制文件（无论内容是否相同）
+            if git show "$SOURCE_COMMIT":"$file" > "$file" 2>/dev/null; then
+              COPIED_COUNT=$((COPIED_COUNT + 1))
+            else
+              echo "❌ 复制失败: $file"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+          else
+            echo "⚠️ 未找到文件来源: $file"
+            FAILED_COUNT=$((FAILED_COUNT + 1))
           fi
         done
         
         echo "copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
-        echo "📊 覆盖了 $COPIED_COUNT 个文件"
+        echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+        echo "📊 复制完成: $COPIED_COUNT 成功, $FAILED_COUNT 失败"
 
-    - name: Commit overwritten files
-      id: commit_overwrite
+    - name: Commit copied files
+      id: commit_files
       run: |
-        echo "提交覆盖的文件..."
+        echo "提交复制的文件..."
+        
+        # 添加所有文件到暂存区
         git add -A
         
-        # 准备提交信息
-        COMMIT_NAME="${{ github.event.inputs.commit_name }}"
-        COMMIT_DESC="${{ github.event.inputs.commit_description }}"
-        
-        COMMIT_MSG="$COMMIT_NAME"
-        if [ -n "$COMMIT_DESC" ]; then
-          COMMIT_MSG="$COMMIT_MSG"$'\n\n'"$COMMIT_DESC"
+        # 检查是否有变更
+        if git diff --cached --quiet; then
+          echo "ℹ️ 没有检测到文件变更"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "✅ 检测到文件变更，准备提交"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # 准备提交信息
+          COMMIT_NAME="${{ github.event.inputs.commit_name }}"
+          COMMIT_DESC="${{ github.event.inputs.commit_description }}"
+          
+          COMMIT_MSG="$COMMIT_NAME"
+          if [ -n "$COMMIT_DESC" ]; then
+            COMMIT_MSG="$COMMIT_MSG"$'\n\n'"$COMMIT_DESC"
+          fi
+          
+          # 创建提交
+          git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
+          echo "✅ 文件复制提交完成"
         fi
-        
-        git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
-        echo "✅ 文件覆盖提交完成"
 
-    - name: Delete marked files in target repository
-      id: delete_files
+    - name: Merge to target branch
+      id: merge_branch
       run: |
-        echo "在目标仓库中删除标记文件..."
+        echo "合并到目标分支..."
+        git checkout ${{ github.event.inputs.target_branch }}
+        
+        # 使用非快进合并，保留合并历史
+        git merge --no-ff -m "merge: 同步提交" sync-* --author="mozi9 <mozi9>"
+        echo "✅ 合并完成"
+
+    - name: Process deleted files
+      id: process_deleted
+      run: |
+        echo "处理标记的删除文件..."
         DELETED_FILES=$(cat /tmp/deleted_files.txt 2>/dev/null || true)
         
         if [ -n "$DELETED_FILES" ]; then
           DEL_COUNT=0
+          SKIP_COUNT=0
+          
           for file in $DELETED_FILES; do
             if [ -e "$file" ]; then
-              git rm "$file" >/dev/null 2>&1
+              echo "删除: $file"
+              git rm "$file" >/dev/null 2>&1 || rm -rf "$file"
               DEL_COUNT=$((DEL_COUNT + 1))
+            else
+              echo "跳过(不存在): $file"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
             fi
           done
           
           if [ $DEL_COUNT -gt 0 ]; then
-            git commit -m "${{ github.event.inputs.delete_commit_message }}" --author="mozi9 <mozi9>"
+            git commit -m "${{ github.event.inputs.delete_message }}" --author="mozi9 <mozi9>"
             echo "deleted_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+            echo "skipped_count=$SKIP_COUNT" >> $GITHUB_OUTPUT
+            echo "✅ 删除完成: $DEL_COUNT 个文件"
           else
             echo "deleted_count=0" >> $GITHUB_OUTPUT
+            echo "skipped_count=$SKIP_COUNT" >> $GITHUB_OUTPUT
+            echo "ℹ️ 没有需要删除的文件"
           fi
         else
           echo "deleted_count=0" >> $GITHUB_OUTPUT
+          echo "skipped_count=0" >> $GITHUB_OUTPUT
+          echo "ℹ️ 没有标记为删除的文件"
         fi
 
-    - name: Push changes to target repository
+    - name: Push changes
       id: push_changes
       run: |
         echo "推送到目标仓库..."
@@ -233,25 +332,39 @@ jobs:
 
     - name: Cleanup
       run: |
+        echo "清理临时分支..."
         git branch -D sync-* 2>/dev/null || true
+        echo "✅ 清理完成"
 
     - name: Generate final report
       run: |
         echo ""
-        echo "🎉 智能覆盖同步完成!"
+        echo "🎉 强制覆盖同步完成!"
         echo "=========================================="
         echo "📊 执行报告:"
         echo "  源仓库: ${{ github.event.inputs.source_repo }}"
         echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
         echo "  处理提交: ${{ steps.parse_commits.outputs.commit_count }} 个"
-        echo "  覆盖文件: ${{ steps.smart_overwrite.outputs.copied_count }} 个"
-        echo "  删除文件: ${{ steps.delete_files.outputs.deleted_count || 0 }} 个"
+        echo "  提取文件: ${{ steps.extract_files.outputs.unique_file_count }} 个"
+        echo "  成功复制: ${{ steps.copy_files.outputs.copied_count || 0 }} 个"
+        echo "  复制失败: ${{ steps.copy_files.outputs.failed_count || 0 }} 个"
+        echo "  删除文件: ${{ steps.process_deleted.outputs.deleted_count || 0 }} 个"
+        echo "  跳过删除: ${{ steps.process_deleted.outputs.skipped_count || 0 }} 个"
         echo ""
         echo "🔧 同步策略:"
         echo "  ✅ 相同文件: 强制覆盖"
         echo "  ✅ 不同文件: 使用源文件"
-        echo "  ✅ 新增文件: 自动添加"
         echo "  ✅ 删除文件: 标记后处理"
         echo ""
+        echo "📝 提交信息:"
+        echo "  合并提交: ${{ github.event.inputs.commit_name }}"
+        if [ -n "${{ github.event.inputs.commit_description }}" ]; then
+          echo "  提交描述: ${{ github.event.inputs.commit_description }}"
+        fi
+        echo "  删除提交: ${{ github.event.inputs.delete_message }}"
+        echo ""
         echo "👤 操作身份: mozi9 <mozi9>"
+        echo "🔑 使用令牌: Mozi9_PAT"
+        echo ""
+        echo "⏰ 完成时间: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "=========================================="
