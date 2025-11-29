@@ -1,0 +1,372 @@
+name: Repository Sync - Custom Commit with Add/Delete Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'owner/source-repo'
+      target_repo:
+        description: '目标仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'owner/target-repo'
+      source_branch:
+        description: '源分支名'
+        required: true
+        default: 'main'
+      target_branch:
+        description: '目标分支名'
+        required: true
+        default: 'main'
+      commit_hashes:
+        description: '要同步的提交哈希（多个用逗号分隔）'
+        required: true
+        default: '75fef37dde7c3cbcde63ae7542f115fb04d9ee70,fa957cbe93c6260f4968cf3d01ec3974bcd49ff8,5a3d762db366d870e8959c143dc7037c51450675'
+      commit_name:
+        description: '自定义提交名（提交信息标题）'
+        required: true
+        default: 'mozi9: 同步文件变更'
+      commit_description:
+        description: '自定义提交描述（可选）'
+        required: false
+        default: ''
+      max_commits:
+        description: '最大同步提交数量'
+        required: true
+        default: '50'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync-repository:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ secrets.Mozi9_PAT }}
+        ref: ${{ github.event.inputs.target_branch }}
+        fetch-depth: 0
+
+    - name: Add source repository as remote
+      run: |
+        git remote add source-repo https://github.com/${{ github.event.inputs.source_repo }}.git
+        git fetch source-repo ${{ github.event.inputs.source_branch }} --depth=100
+
+    - name: Setup Git config for Mozi9
+      run: |
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
+
+    - name: Parse and validate commit hashes
+      id: parse_commits
+      run: |
+        # 清理输入，移除空格和换行
+        CLEAN_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' '\n' | grep -v '^$')
+        
+        # 验证每个提交哈希是否存在
+        VALID_COMMITS=""
+        INVALID_COMMITS=""
+        COMMIT_COUNT=0
+        
+        for hash in $CLEAN_HASHES; do
+          if git rev-parse --verify "$hash" >/dev/null 2>&1; then
+            COMMIT_SUBJECT=$(git log -1 --format="%s" "$hash" 2>/dev/null || echo "无法获取提交信息")
+            echo "✅ 提交有效: $hash - $COMMIT_SUBJECT"
+            VALID_COMMITS="$VALID_COMMITS$hash"$'\n'
+            COMMIT_COUNT=$((COMMIT_COUNT + 1))
+          else
+            echo "❌ 提交无效: $hash"
+            INVALID_COMMITS="$INVALID_COMMITS$hash"$'\n'
+          fi
+        done
+        
+        if [ $COMMIT_COUNT -eq 0 ]; then
+          echo "❌ 错误: 没有找到有效的提交哈希"
+          exit 1
+        fi
+        
+        # 限制提交数量
+        MAX_COMMITS=${{ github.event.inputs.max_commits }}
+        if [ $COMMIT_COUNT -gt $MAX_COMMITS ]; then
+          echo "⚠️ 警告: 提交数量 $COMMIT_COUNT 超过最大限制 $MAX_COMMITS，将只处理前 $MAX_COMMITS 个提交"
+          VALID_COMMITS=$(echo "$VALID_COMMITS" | head -n $MAX_COMMITS)
+          COMMIT_COUNT=$MAX_COMMITS
+        fi
+        
+        # 保存有效提交到文件
+        echo "$VALID_COMMITS" > /tmp/valid_commits.txt
+        
+        # 输出统计信息
+        echo "📊 提交验证完成:"
+        echo "  有效提交: $COMMIT_COUNT 个"
+        if [ -n "$INVALID_COMMITS" ]; then
+          echo "  无效提交: $(echo "$INVALID_COMMITS" | grep -c .) 个"
+          echo "$INVALID_COMMITS"
+        fi
+        
+        echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+
+    - name: Collect and deduplicate files from source commits
+      id: collect_files
+      run: |
+        echo "从源提交中收集文件并去重..."
+        
+        # 使用关联数组去重（后面的提交覆盖前面的）
+        declare -A ALL_FILES_HASH
+        declare -A FILE_TO_COMMIT_MAP
+        declare -A DELETED_FILES_HASH
+        
+        COMMITS=$(cat /tmp/valid_commits.txt)
+        
+        # 按提交顺序处理文件
+        for COMMIT in $COMMITS; do
+          echo "📝 处理提交: $COMMIT"
+          
+          # 获取该提交的所有变更文件
+          COMMIT_FILES=$(git show --name-only --format= "$COMMIT" 2>/dev/null | grep -v '^$' || true)
+          
+          # 获取该提交中删除的文件
+          DELETED_IN_COMMIT=$(git show "$COMMIT" --name-only --diff-filter=D --format= 2>/dev/null || true)
+          if [ -n "$DELETED_IN_COMMIT" ]; then
+            echo "  删除文件: $(echo "$DELETED_IN_COMMIT" | wc -l) 个"
+            for file in $DELETED_IN_COMMIT; do
+              DELETED_FILES_HASH["$file"]=1
+              # 从文件集合中移除被删除的文件
+              unset ALL_FILES_HASH["$file"]
+              unset FILE_TO_COMMIT_MAP["$file"]
+            done
+          fi
+          
+          # 处理新增和修改的文件
+          AM_FILES=$(git show "$COMMIT" --name-only --diff-filter=AM --format= 2>/dev/null || true)
+          if [ -n "$AM_FILES" ]; then
+            echo "  新增/修改文件: $(echo "$AM_FILES" | wc -l) 个"
+            for file in $AM_FILES; do
+              # 跳过删除的文件
+              if [ -n "${DELETED_FILES_HASH[$file]}" ]; then
+                continue
+              fi
+              # 记录文件及其对应的最新提交
+              ALL_FILES_HASH["$file"]=1
+              FILE_TO_COMMIT_MAP["$file"]=$COMMIT
+            done
+          fi
+        done
+        
+        # 保存结果
+        printf "%s\n" "${!ALL_FILES_HASH[@]}" | sort > /tmp/all_files.txt
+        printf "%s\n" "${!DELETED_FILES_HASH[@]}" | sort > /tmp/deleted_files.txt
+        
+        # 保存文件到提交的映射
+        for file in "${!FILE_TO_COMMIT_MAP[@]}"; do
+          echo "$file:${FILE_TO_COMMIT_MAP[$file]}" >> /tmp/file_commit_map.txt
+        done
+        
+        echo "📊 文件收集完成:"
+        echo "  保留文件: ${#ALL_FILES_HASH[@]} 个"
+        echo "  删除文件: ${#DELETED_FILES_HASH[@]} 个"
+        echo "  文件映射: /tmp/file_commit_map.txt"
+
+    - name: Copy files from source commits
+      id: copy_files
+      run: |
+        echo "从源提交复制文件到目标仓库..."
+        
+        ALL_FILES=$(cat /tmp/all_files.txt 2>/dev/null || true)
+        
+        if [ -n "$ALL_FILES" ]; then
+          COPY_COUNT=0
+          FAIL_COUNT=0
+          
+          for file in $ALL_FILES; do
+            # 从文件映射中获取对应的提交
+            COMMIT=$(grep "^$file:" /tmp/file_commit_map.txt 2>/dev/null | cut -d: -f2)
+            
+            if [ -z "$COMMIT" ]; then
+              echo "⚠️ 警告: 未找到文件 $file 的提交映射"
+              continue
+            fi
+            
+            if git show "$COMMIT":"$file" >/dev/null 2>&1; then
+              echo "📄 复制: $file (来自提交 $COMMIT)"
+              mkdir -p "$(dirname "$file")"
+              
+              # 复制文件内容
+              if git show "$COMMIT":"$file" > "$file" 2>/dev/null; then
+                git add "$file"
+                COPY_COUNT=$((COPY_COUNT + 1))
+              else
+                echo "❌ 复制失败: $file"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+              fi
+            else
+              echo "❌ 无法获取文件: $file"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+          done
+          
+          echo "✅ 文件复制完成:"
+          echo "  成功: $COPY_COUNT 个文件"
+          echo "  失败: $FAIL_COUNT 个文件"
+          
+          echo "copy_count=$COPY_COUNT" >> $GITHUB_OUTPUT
+          echo "fail_count=$FAIL_COUNT" >> $GITHUB_OUTPUT
+        else
+          echo "ℹ️ 没有文件需要复制"
+          echo "copy_count=0" >> $GITHUB_OUTPUT
+          echo "fail_count=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create commit with file changes
+      id: create_commit
+      run: |
+        echo "创建文件变更提交..."
+        
+        # 检查是否有文件变更
+        if git diff --cached --quiet; then
+          echo "ℹ️ 没有文件变更需要提交"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "📝 检测到文件变更，准备提交..."
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # 准备提交信息
+          COMMIT_NAME="${{ github.event.inputs.commit_name }}"
+          COMMIT_DESC="${{ github.event.inputs.commit_description }}"
+          
+          if [ -z "$COMMIT_NAME" ]; then
+            COMMIT_NAME="mozi9: 同步文件变更"
+          fi
+          
+          COMMIT_MSG="$COMMIT_NAME"
+          if [ -n "$COMMIT_DESC" ]; then
+            COMMIT_MSG="$COMMIT_MSG"$'\n\n'"$COMMIT_DESC"
+          fi
+          
+          # 添加统计信息
+          FILE_COUNT=${{ steps.copy_files.outputs.copy_count || 0 }}
+          DEL_COUNT=$(cat /tmp/deleted_files.txt 2>/dev/null | wc -l || echo 0)
+          COMMIT_COUNT=${{ steps.parse_commits.outputs.commit_count }}
+          
+          COMMIT_MSG="$COMMIT_MSG"$'\n\n'"同步统计:"
+          COMMIT_MSG="$COMMIT_MSG"$'\n'"- 新增/修改文件: $FILE_COUNT 个"
+          COMMIT_MSG="$COMMIT_MSG"$'\n'"- 标记删除文件: $DEL_COUNT 个" 
+          COMMIT_MSG="$COMMIT_MSG"$'\n'"- 源提交数量: $COMMIT_COUNT 个"
+          
+          # 创建提交
+          git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
+          echo "✅ 文件变更提交创建完成"
+          echo "提交哈希: $(git rev-parse HEAD)"
+        fi
+
+    - name: Delete marked files
+      id: delete_files
+      run: |
+        echo "处理标记为删除的文件..."
+        
+        DELETED_FILES=$(cat /tmp/deleted_files.txt 2>/dev/null || true)
+        
+        if [ -n "$DELETED_FILES" ]; then
+          DEL_COUNT=0
+          SKIP_COUNT=0
+          
+          for file in $DELETED_FILES; do
+            if [ -e "$file" ]; then
+              echo "🗑️ 删除: $file"
+              # 使用 git rm 来确保正确删除
+              git rm "$file" >/dev/null 2>&1 || rm -rf "$file"
+              DEL_COUNT=$((DEL_COUNT + 1))
+            else
+              echo "ℹ️ 跳过(不存在): $file"
+              SKIP_COUNT=$((SKIP_COUNT + 1))
+            fi
+          done
+          
+          if [ $DEL_COUNT -gt 0 ]; then
+            git commit -m "mozi9: 删除标记为删除的文件 ($DEL_COUNT 个)" --author="mozi9 <mozi9>"
+            echo "✅ 删除操作完成:"
+            echo "  实际删除: $DEL_COUNT 个文件"
+            echo "  跳过(不存在): $SKIP_COUNT 个文件"
+          else
+            echo "ℹ️ 没有需要删除的文件"
+          fi
+          
+          echo "deleted_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIP_COUNT" >> $GITHUB_OUTPUT
+        else
+          echo "ℹ️ 没有标记为删除的文件"
+          echo "deleted_count=0" >> $GITHUB_OUTPUT
+          echo "skipped_count=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Push changes to target repository
+      run: |
+        echo "推送到目标仓库..."
+        
+        # 检查是否有需要推送的变更
+        if git diff --quiet origin/${{ github.event.inputs.target_branch }} ${{ github.event.inputs.target_branch }}; then
+          echo "ℹ️ 没有需要推送的变更"
+        else
+          echo "🚀 推送变更到目标仓库..."
+          git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/${{ github.event.inputs.target_repo }}.git ${{ github.event.inputs.target_branch }}
+          echo "✅ 推送完成"
+        fi
+
+    - name: Generate final report
+      run: |
+        echo "🎉 同步完成！"
+        echo "=================================================="
+        echo "📊 最终统计:"
+        echo "  源提交数量: ${{ steps.parse_commits.outputs.commit_count }} 个"
+        echo "  成功复制文件: ${{ steps.copy_files.outputs.copy_count || 0 }} 个"
+        echo "  复制失败文件: ${{ steps.copy_files.outputs.fail_count || 0 }} 个"
+        echo "  实际删除文件: ${{ steps.delete_files.outputs.deleted_count || 0 }} 个"
+        echo "  跳过删除文件: ${{ steps.delete_files.outputs.skipped_count || 0 }} 个"
+        echo ""
+        echo "🔧 配置信息:"
+        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "  目标分支: ${{ github.event.inputs.target_branch }}"
+        echo "  提交名称: ${{ github.event.inputs.commit_name }}"
+        echo ""
+        
+        # 显示提交信息
+        if [ "${{ steps.create_commit.outputs.has_changes }}" = "true" ]; then
+          echo "📝 文件变更提交:"
+          git log --format=%B -n 1 HEAD~$(({{ steps.delete_files.outputs.deleted_count || 0 }} > 0 ? 1 : 0))
+          echo ""
+        fi
+        
+        if [ "${{ steps.delete_files.outputs.deleted_count || 0 }}" -gt 0 ]; then
+          echo "🗑️ 删除操作提交:"
+          git log -1 --format=%B
+          echo ""
+        fi
+        
+        # 显示文件列表摘要
+        echo "📋 文件列表摘要:"
+        if [ -s /tmp/all_files.txt ]; then
+          echo "保留文件 ($(cat /tmp/all_files.txt | wc -l) 个):"
+          head -5 /tmp/all_files.txt | sed 's/^/  /'
+          if [ $(cat /tmp/all_files.txt | wc -l) -gt 5 ]; then
+            echo "  ... 和 $(($(cat /tmp/all_files.txt | wc -l) - 5)) 个更多文件"
+          fi
+        fi
+        
+        if [ -s /tmp/deleted_files.txt ]; then
+          echo "删除文件 ($(cat /tmp/deleted_files.txt | wc -l) 个):"
+          head -5 /tmp/deleted_files.txt | sed 's/^/  /'
+          if [ $(cat /tmp/deleted_files.txt | wc -l) -gt 5 ]; then
+            echo "  ... 和 $(($(cat /tmp/deleted_files.txt | wc -l) - 5)) 个更多文件"
+          fi
+        fi
+        
+        echo ""
+        echo "💾 备份文件位置:"
+        echo "  删除文件列表: /tmp/deleted_files.txt"
+        echo "  文件映射关系: /tmp/file_commit_map.txt"
+        echo "  有效提交列表: /tmp/valid_commits.txt"
+
