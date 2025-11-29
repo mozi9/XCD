@@ -1,0 +1,257 @@
+name: Manual Repository Sync - Smart Overwrite
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'mozi9/source-repo'
+      source_branch:
+        description: '源分支名 (留空使用默认分支)'
+        required: false
+        default: ''
+      target_repo:
+        description: '目标仓库地址 (格式: owner/repo)'
+        required: true
+        default: 'mozi9/target-repo'
+      target_branch:
+        description: '目标分支名'
+        required: true
+        default: 'main'
+      commit_hashes:
+        description: '要同步的提交哈希（多个用逗号分隔）'
+        required: true
+        default: ''
+      commit_name:
+        description: '合并提交名'
+        required: true
+        default: 'sync: 同步提交'
+      commit_description:
+        description: '合并提交描述（可选）'
+        required: false
+        default: ''
+      delete_commit_message:
+        description: '删除文件提交信息'
+        required: true
+        default: 'delete: 删除标记文件'
+      max_commits:
+        description: '最大同步提交数量'
+        required: true
+        default: '20'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  sync-repository:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout target repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.target_repo }}
+        token: ${{ secrets.Mozi9_PAT }}
+        ref: ${{ github.event.inputs.target_branch }}
+        fetch-depth: 0
+
+    - name: Setup Mozi9 Git identity
+      run: |
+        git config --global user.name "mozi9"
+        git config --global user.email "mozi9"
+        echo "Git identity set to: mozi9 <mozi9>"
+
+    - name: Add source repository
+      id: add_source
+      run: |
+        echo "添加源仓库..."
+        SOURCE_REPO="${{ github.event.inputs.source_repo }}"
+        SOURCE_BRANCH="${{ github.event.inputs.source_branch }}"
+        
+        if [ -z "$SOURCE_BRANCH" ]; then
+          echo "使用源仓库默认分支"
+          git remote add source-repo https://github.com/$SOURCE_REPO.git
+          git fetch source-repo
+        else
+          echo "使用源仓库分支: $SOURCE_BRANCH"
+          git remote add source-repo https://github.com/$SOURCE_REPO.git
+          git fetch source-repo $SOURCE_BRANCH
+        fi
+        echo "✅ 源仓库添加完成"
+
+    - name: Parse and validate commit hashes
+      id: parse_commits
+      run: |
+        echo "解析和验证提交哈希..."
+        COMMIT_HASHES=$(echo '${{ github.event.inputs.commit_hashes }}' | tr -d '[:space:]' | tr ',' ' ')
+        
+        VALID_COMMITS=()
+        
+        for hash in $COMMIT_HASHES; do
+          FULL_HASH=$(git rev-parse --verify "$hash" 2>/dev/null || echo "")
+          if [ -n "$FULL_HASH" ]; then
+            COMMIT_SUBJECT=$(git log -1 --format="%s" "$FULL_HASH" 2>/dev/null || echo "无法获取提交信息")
+            echo "✅ 提交有效: $hash -> $FULL_HASH - $COMMIT_SUBJECT"
+            VALID_COMMITS+=("$FULL_HASH")
+          else
+            echo "❌ 提交无效: $hash"
+          fi
+        done
+        
+        if [ ${#VALID_COMMITS[@]} -eq 0 ]; then
+          echo "❌ 错误: 没有找到有效的提交"
+          exit 1
+        fi
+        
+        MAX_COMMITS=${{ github.event.inputs.max_commits }}
+        if [ ${#VALID_COMMITS[@]} -gt $MAX_COMMITS ]; then
+          echo "⚠️ 提交数量 ${#VALID_COMMITS[@]} 超过最大限制 $MAX_COMMITS"
+          VALID_COMMITS=("${VALID_COMMITS[@]:0:$MAX_COMMITS}")
+        fi
+        
+        printf "%s\n" "${VALID_COMMITS[@]}" > /tmp/valid_commits.txt
+        echo "commit_count=${#VALID_COMMITS[@]}" >> $GITHUB_OUTPUT
+        echo "📊 将处理 ${#VALID_COMMITS[@]} 个有效提交"
+
+    - name: Collect files marked for deletion
+      id: collect_deleted_files
+      run: |
+        echo "收集源提交中标记为删除的文件..."
+        COMMITS=$(cat /tmp/valid_commits.txt)
+        DELETED_FILES=""
+        
+        for COMMIT in $COMMITS; do
+          DELETED_IN_COMMIT=$(git show "$COMMIT" --name-only --diff-filter=D --format= 2>/dev/null || true)
+          if [ -n "$DELETED_IN_COMMIT" ]; then
+            DELETED_FILES="$DELETED_FILES"$'\n'"$DELETED_IN_COMMIT"
+          fi
+        done
+        
+        echo "$DELETED_FILES" | sort | uniq | grep -v '^$' > /tmp/deleted_files.txt
+        DEL_COUNT=$(cat /tmp/deleted_files.txt 2>/dev/null | wc -l || echo 0)
+        echo "deleted_files_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+        echo "📊 收集到 $DEL_COUNT 个删除文件标记"
+
+    - name: Create sync branch
+      id: create_branch
+      run: |
+        echo "创建同步分支..."
+        SYNC_BRANCH="sync-$(date +%s)"
+        git checkout -b "$SYNC_BRANCH"
+        echo "branch_name=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+    - name: Smart overwrite with source files
+      id: smart_overwrite
+      run: |
+        echo "智能覆盖：相同文件也覆盖，不同文件用源文件..."
+        COMMITS=$(cat /tmp/valid_commits.txt)
+        
+        # 获取所有源提交中的文件
+        ALL_SOURCE_FILES=""
+        for COMMIT in $COMMITS; do
+          COMMIT_FILES=$(git show --name-only --format= "$COMMIT" 2>/dev/null | grep -v '^$' || true)
+          ALL_SOURCE_FILES="$ALL_SOURCE_FILES"$'\n'"$COMMIT_FILES"
+        done
+        
+        # 去重得到源文件列表
+        SOURCE_FILES=$(echo "$ALL_SOURCE_FILES" | sort | uniq | grep -v '^$')
+        echo "$SOURCE_FILES" > /tmp/source_files.txt
+        
+        # 逐个文件从源提交复制（强制覆盖）
+        COPIED_COUNT=0
+        for file in $SOURCE_FILES; do
+          # 找到包含该文件的最后一个提交
+          SOURCE_COMMIT=""
+          for COMMIT in $COMMITS; do
+            if git show "$COMMIT":"$file" >/dev/null 2>&1; then
+              SOURCE_COMMIT=$COMMIT
+            fi
+          done
+          
+          if [ -n "$SOURCE_COMMIT" ]; then
+            echo "覆盖文件: $file (来自提交 $SOURCE_COMMIT)"
+            mkdir -p "$(dirname "$file")"
+            git show "$SOURCE_COMMIT":"$file" > "$file" 2>/dev/null && COPIED_COUNT=$((COPIED_COUNT + 1))
+          fi
+        done
+        
+        echo "copied_count=$COPIED_COUNT" >> $GITHUB_OUTPUT
+        echo "📊 覆盖了 $COPIED_COUNT 个文件"
+
+    - name: Commit overwritten files
+      id: commit_overwrite
+      run: |
+        echo "提交覆盖的文件..."
+        git add -A
+        
+        # 准备提交信息
+        COMMIT_NAME="${{ github.event.inputs.commit_name }}"
+        COMMIT_DESC="${{ github.event.inputs.commit_description }}"
+        
+        COMMIT_MSG="$COMMIT_NAME"
+        if [ -n "$COMMIT_DESC" ]; then
+          COMMIT_MSG="$COMMIT_MSG"$'\n\n'"$COMMIT_DESC"
+        fi
+        
+        git commit -m "$COMMIT_MSG" --author="mozi9 <mozi9>"
+        echo "✅ 文件覆盖提交完成"
+
+    - name: Delete marked files in target repository
+      id: delete_files
+      run: |
+        echo "在目标仓库中删除标记文件..."
+        DELETED_FILES=$(cat /tmp/deleted_files.txt 2>/dev/null || true)
+        
+        if [ -n "$DELETED_FILES" ]; then
+          DEL_COUNT=0
+          for file in $DELETED_FILES; do
+            if [ -e "$file" ]; then
+              git rm "$file" >/dev/null 2>&1
+              DEL_COUNT=$((DEL_COUNT + 1))
+            fi
+          done
+          
+          if [ $DEL_COUNT -gt 0 ]; then
+            git commit -m "${{ github.event.inputs.delete_commit_message }}" --author="mozi9 <mozi9>"
+            echo "deleted_count=$DEL_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "deleted_count=0" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "deleted_count=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Push changes to target repository
+      id: push_changes
+      run: |
+        echo "推送到目标仓库..."
+        TARGET_REPO="${{ github.event.inputs.target_repo }}"
+        TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+        
+        git push https://mozi9:${{ secrets.Mozi9_PAT }}@github.com/$TARGET_REPO.git $TARGET_BRANCH
+        echo "✅ 推送完成"
+
+    - name: Cleanup
+      run: |
+        git branch -D sync-* 2>/dev/null || true
+
+    - name: Generate final report
+      run: |
+        echo ""
+        echo "🎉 智能覆盖同步完成!"
+        echo "=========================================="
+        echo "📊 执行报告:"
+        echo "  源仓库: ${{ github.event.inputs.source_repo }}"
+        echo "  目标仓库: ${{ github.event.inputs.target_repo }}"
+        echo "  处理提交: ${{ steps.parse_commits.outputs.commit_count }} 个"
+        echo "  覆盖文件: ${{ steps.smart_overwrite.outputs.copied_count }} 个"
+        echo "  删除文件: ${{ steps.delete_files.outputs.deleted_count || 0 }} 个"
+        echo ""
+        echo "🔧 同步策略:"
+        echo "  ✅ 相同文件: 强制覆盖"
+        echo "  ✅ 不同文件: 使用源文件"
+        echo "  ✅ 新增文件: 自动添加"
+        echo "  ✅ 删除文件: 标记后处理"
+        echo ""
+        echo "👤 操作身份: mozi9 <mozi9>"
+        echo "=========================================="
